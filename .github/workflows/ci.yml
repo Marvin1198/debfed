@@ -1,0 +1,28 @@
+## Runs every gate on ordinary pushes and pull requests.
+## The gates themselves live in checks.yml so release.yml runs the
+## identical set before publishing anything.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a newly disclosed CVE in a dependency surfaces even
+    # when nobody has pushed.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+    permissions:
+      contents: read

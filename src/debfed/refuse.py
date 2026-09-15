@@ -1,0 +1,345 @@
+"""The refusal engine.
+
+debfed's value is as much in what it refuses as in what it installs. A
+tool that half-installs a base package is worse than one that declines.
+Every refusal names a specific reason; none of them are "unsupported".
+
+Refusals run BEFORE any spec is rendered, so a rejected package never
+reaches rpmbuild.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from enum import StrEnum
+
+from .deb import Deb
+from .depsolve import Resolution
+from .layout import Relocation
+
+
+class Verdict(StrEnum):
+    STRATEGY_A = "A"          # translate to RPM, host libraries satisfy it
+    STRATEGY_B = "B"          # private prefix, bundle leaf libraries
+    UNKNOWN = "unknown"       # dependency resolution was not performed
+    REFUSE = "refuse"
+
+
+class Severity(StrEnum):
+    FATAL = "fatal"
+    WARN = "warn"
+
+
+@dataclass(frozen=True)
+class Finding:
+    severity: Severity
+    code: str
+    message: str
+    detail: str = ""
+
+    def __str__(self) -> str:
+        head = f"[{self.code}] {self.message}"
+        return f"{head}\n    {self.detail}" if self.detail else head
+
+
+# Packages that own the base system. Installing a Debian build of any of
+# these over Fedora's copy is unrecoverable.
+BASE_PACKAGES = frozenset(
+    {
+        "libc6", "libc6-dev", "libc-bin", "glibc", "locales",
+        "systemd", "systemd-sysv", "libsystemd0", "udev",
+        "dbus", "libdbus-1-3",
+        "coreutils", "bash", "dash", "sed", "grep", "gawk", "tar", "gzip",
+        "util-linux", "mount", "login", "passwd", "libpam0g",
+        "dpkg", "apt", "perl-base",
+        "libselinux1", "libgcc-s1", "libstdc++6",
+        "e2fsprogs", "initramfs-tools",
+        "grub-common", "grub-pc", "grub-efi-amd64", "shim-signed",
+        "gdm3", "sddm", "lightdm", "xserver-xorg-core",
+        "linux-image-generic", "linux-headers-generic",
+    }
+)
+
+BASE_PATH_PREFIXES = (
+    "/boot/",
+    "/usr/lib/modules/",
+    "/lib/modules/",
+    "/usr/lib/systemd/system/",
+    "/usr/lib/dracut/",
+    "/usr/lib/kernel/",
+    "/etc/grub.d/",
+    "/usr/lib/grub/",
+)
+
+# Files that mean this package expects dpkg to be the package manager.
+DPKG_ONLY_FILES = (
+    "/var/lib/dpkg",
+    "/etc/apt/sources.list.d",
+    "/etc/apt/trusted.gpg.d",
+    "/usr/share/dpkg",
+)
+
+# dpkg triggers that map cleanly onto an rpm scriptlet. `activate-noawait
+# ldconfig` is added automatically by dh_makeshlibs to nearly every library
+# package, so refusing on the presence of a triggers file alone rejects
+# most of the archive for no reason. Value is the scriptlet we emit.
+SAFE_TRIGGERS: dict[str, str] = {
+    "ldconfig": "/sbin/ldconfig",
+    "/usr/share/applications": "update-desktop-database &>/dev/null || :",
+    "/usr/share/icons/hicolor": (
+        "gtk-update-icon-cache -qtf /usr/share/icons/hicolor &>/dev/null || :"
+    ),
+    "/usr/share/mime": "update-mime-database /usr/share/mime &>/dev/null || :",
+    "/usr/share/mime/packages": (
+        "update-mime-database /usr/share/mime &>/dev/null || :"
+    ),
+    "/usr/share/glib-2.0/schemas": (
+        "glib-compile-schemas /usr/share/glib-2.0/schemas &>/dev/null || :"
+    ),
+    "/usr/share/fonts": "fc-cache -f &>/dev/null || :",
+    "/usr/share/man": ":",      # man-db indexes lazily on Fedora
+    "man-db": ":",
+    "/usr/share/doc": ":",
+    "update-menus": ":",        # Debian menu system, no Fedora analogue needed
+}
+
+# Maintainer-script constructs with no RPM equivalent.
+SCRIPT_BLOCKERS = (
+    (r"\bdpkg-divert\b", "DIVERT", "uses dpkg-divert; rpm has no file diversion"),
+    (r"\bdpkg-trigger\b", "TRIGGER", "uses dpkg triggers"),
+    (r"\bdb_input\b|\bdb_get\b|\. /usr/share/debconf", "DEBCONF",
+     "uses debconf for interactive configuration"),
+    (r"\bupdate-initramfs\b", "INITRAMFS", "rebuilds the initramfs"),
+    (r"\bdkms\b", "DKMS", "builds a kernel module via DKMS"),
+    (r"\bupdate-grub\b|\bgrub-mkconfig\b", "GRUB", "modifies the bootloader"),
+    (r"\bsystemctl\s+(enable|start)\b", "SYSTEMD_UNIT",
+     "enables or starts a systemd unit"),
+    (r"\badduser\b|\buseradd\b", "USER", "creates a system user"),
+)
+
+# Constructs we allow and translate into scriptlets.
+SCRIPT_ALLOWED = (
+    r"\bldconfig\b",
+    r"\bupdate-desktop-database\b",
+    r"\bdesktop-file-install\b",
+    r"\bgtk-update-icon-cache\b",
+    r"\bupdate-mime-database\b",
+    r"\bxdg-mime\b",
+    r"\bxdg-icon-resource\b",
+    r"\bupdate-alternatives\b",   # allowed only in the single-symlink case
+    r"\bglib-compile-schemas\b",
+    r"\bfc-cache\b",
+    r"\bupdate-menus\b",
+    r"\bapt-key\b",               # stripped, not executed
+    r"\bapt\b",                   # repo registration, stripped
+    r"\bset -e\b",
+    r"\bexit 0\b",
+)
+
+
+@dataclass
+class Assessment:
+    verdict: Verdict
+    findings: list[Finding]
+    reason: str = ""
+
+    @property
+    def fatal(self) -> list[Finding]:
+        return [f for f in self.findings if f.severity is Severity.FATAL]
+
+    @property
+    def warnings(self) -> list[Finding]:
+        return [f for f in self.findings if f.severity is Severity.WARN]
+
+    @property
+    def ok(self) -> bool:
+        return self.verdict is not Verdict.REFUSE
+
+
+def assess(
+    deb: Deb,
+    reloc: Relocation,
+    res: Resolution,
+    *,
+    allow_private_prefix: bool = True,
+) -> Assessment:
+    """Decide whether and how this package can be installed."""
+    findings: list[Finding] = []
+
+    # ---- identity refusals -------------------------------------------
+    if deb.name in BASE_PACKAGES:
+        findings.append(
+            Finding(
+                Severity.FATAL, "BASE_PACKAGE",
+                f"{deb.name} is a base system package",
+                "Installing a Debian build over Fedora's copy is unrecoverable. "
+                "This is out of scope by design.",
+            )
+        )
+
+    arch = deb.architecture
+    if arch not in ("amd64", "all"):
+        findings.append(
+            Finding(
+                Severity.FATAL, "ARCH",
+                f"architecture {arch} is not supported",
+                "debfed v1 targets x86_64 only.",
+            )
+        )
+
+    if deb.fields.get("Pre-Depends"):
+        findings.append(
+            Finding(
+                Severity.FATAL, "PRE_DEPENDS",
+                "package declares Pre-Depends",
+                "Pre-Depends encodes dpkg unpack ordering with no rpm analogue.",
+            )
+        )
+
+    # ---- payload refusals --------------------------------------------
+    for f in reloc.files:
+        if any(f.startswith(p) for p in BASE_PATH_PREFIXES):
+            findings.append(
+                Finding(
+                    Severity.FATAL, "SYSTEM_PATH",
+                    "package writes into a boot or kernel path",
+                    f,
+                )
+            )
+            break
+
+    for f in reloc.files:
+        if any(f.startswith(p) for p in DPKG_ONLY_FILES):
+            findings.append(
+                Finding(
+                    Severity.FATAL, "DPKG_STATE",
+                    "package writes into dpkg or apt state directories",
+                    f,
+                )
+            )
+            break
+
+    unsafe_triggers = [
+        f"{directive} {target}"
+        for directive, target in deb.triggers
+        if target not in SAFE_TRIGGERS
+    ]
+    if unsafe_triggers:
+        findings.append(
+            Finding(
+                Severity.FATAL, "TRIGGERS",
+                "package declares dpkg triggers with no rpm equivalent",
+                ", ".join(unsafe_triggers),
+            )
+        )
+
+    # ---- maintainer scripts ------------------------------------------
+    for script_name, body in deb.maintainer_scripts.items():
+        for pattern, code, message in SCRIPT_BLOCKERS:
+            if re.search(pattern, body):
+                severity = (
+                    Severity.WARN
+                    if code in ("USER", "SYSTEMD_UNIT")
+                    else Severity.FATAL
+                )
+                findings.append(
+                    Finding(severity, code, f"{script_name}: {message}")
+                )
+
+    # ---- dependency verdict ------------------------------------------
+    glibc_gap = res.needs_newer_glibc
+    if glibc_gap:
+        findings.append(
+            Finding(
+                Severity.FATAL, "GLIBC_SKEW",
+                "payload needs a newer glibc than this host provides",
+                f"{glibc_gap} is unsatisfiable. Bundling glibc would require "
+                "shipping a matching ld.so; that is out of scope.",
+            )
+        )
+
+    toolkit_gap = res.missing_toolkit
+    if toolkit_gap:
+        findings.append(
+            Finding(
+                Severity.FATAL, "TOOLKIT_GAP",
+                "payload would require bundling a toolkit stack",
+                ", ".join(toolkit_gap[:6])
+                + "\n    Prefixing LD_LIBRARY_PATH breaks as soon as the app "
+                "dlopens a host module (mesa, GTK modules, NSS).",
+            )
+        )
+
+    setuid_paths = reloc.setuid or deb.payload_setuid
+    if setuid_paths:
+        findings.append(
+            Finding(
+                Severity.WARN, "SETUID",
+                "payload declares setuid/setgid files; the bits were dropped",
+                ", ".join(setuid_paths[:8])
+                + "\n    debfed extracts with tarfile's data filter, which clears "
+                "these bits. An app relying on a SUID helper (a legacy "
+                "chrome-sandbox, for example) will need user namespaces instead.",
+            )
+        )
+
+    unowned = [d for d in reloc.dirs if d in __import__(
+        "debfed.layout", fromlist=["UNOWNABLE_DIRS"]
+    ).UNOWNABLE_DIRS]
+    if unowned:
+        findings.append(
+            Finding(
+                Severity.WARN, "SHARED_DIRS",
+                f"{len(unowned)} directories are owned by Fedora base packages",
+                "These will be excluded from %files (this is what makes alien "
+                "output uninstallable).",
+            )
+        )
+
+    if deb.conffiles:
+        findings.append(
+            Finding(
+                Severity.WARN, "CONFFILES",
+                f"{len(deb.conffiles)} conffiles will become %config(noreplace)",
+            )
+        )
+
+    # ---- verdict -----------------------------------------------------
+    fatal = [f for f in findings if f.severity is Severity.FATAL]
+    if fatal:
+        return Assessment(Verdict.REFUSE, findings, fatal[0].message)
+
+    if not res.checked:
+        return Assessment(
+            Verdict.UNKNOWN, findings,
+            f"{len(res.requires)} capabilities extracted; dnf resolution "
+            "skipped, so no strategy can be chosen",
+        )
+
+    if not res.requires:
+        return Assessment(
+            Verdict.STRATEGY_A, findings, "no ELF payload; pure data package"
+        )
+
+    if not res.unsatisfied:
+        return Assessment(
+            Verdict.STRATEGY_A, findings,
+            f"all {len(res.requires)} requirements resolve against Fedora",
+        )
+
+    if not allow_private_prefix:
+        findings.append(
+            Finding(
+                Severity.FATAL, "UNSATISFIED",
+                f"{len(res.unsatisfied)} requirements unsatisfied and "
+                "private-prefix fallback is disabled",
+                ", ".join(res.unsatisfied[:6]),
+            )
+        )
+        return Assessment(Verdict.REFUSE, findings, "unsatisfied dependencies")
+
+    return Assessment(
+        Verdict.STRATEGY_B, findings,
+        f"{len(res.unsatisfied)} leaf library/libraries must be bundled",
+    )

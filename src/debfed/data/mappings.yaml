@@ -1,0 +1,90 @@
+# debfed dependency mapping database
+#
+# Sonames are resolved by rpm itself and do NOT belong here. This file
+# covers only requirements that cannot be expressed as an ELF dependency:
+# fonts, icon themes, helper binaries invoked at runtime, and data-only
+# packages.
+#
+# Syntax:
+#   packages:
+#     <debian-name>: <fedora-name>          # one package
+#     <debian-name>: [<fedora-a>, <fedora-b>]  # several
+#     <debian-name>: null                   # satisfied implicitly, drop it
+#
+# User overrides live in ~/.config/debfed/mappings.yaml and win.
+
+version: "1"
+
+packages:
+  # --- fonts -------------------------------------------------------------
+  fonts-liberation: liberation-fonts
+  fonts-liberation2: liberation-fonts
+  fonts-dejavu-core: dejavu-sans-fonts
+  fonts-noto-color-emoji: google-noto-emoji-color-fonts
+  fonts-opensymbol: libreoffice-opensymbol-fonts
+  fontconfig: fontconfig
+  fontconfig-config: fontconfig
+
+  # --- desktop integration helpers ---------------------------------------
+  desktop-file-utils: desktop-file-utils
+  shared-mime-info: shared-mime-info
+  hicolor-icon-theme: hicolor-icon-theme
+  adwaita-icon-theme: adwaita-icon-theme
+  xdg-utils: xdg-utils
+  libnotify-bin: libnotify
+  gsettings-desktop-schemas: gsettings-desktop-schemas
+
+  # --- runtime helper binaries -------------------------------------------
+  ca-certificates: ca-certificates
+  xdg-desktop-portal: xdg-desktop-portal
+  policykit-1: polkit
+  pkexec: polkit
+  dbus-user-session: dbus-daemon
+  libsecret-1-0: libsecret
+  gnome-keyring: gnome-keyring
+  zenity: zenity
+  wget: wget
+  curl: curl
+  procps: procps-ng
+  psmisc: psmisc
+  lsb-release: fedora-release-common
+
+  # --- media / codecs (often RPM Fusion) ---------------------------------
+  gstreamer1.0-plugins-base: gstreamer1-plugins-base
+  gstreamer1.0-plugins-good: gstreamer1-plugins-good
+  pulseaudio-utils: pulseaudio-utils
+  pipewire: pipewire
+
+  # --- toolkits that also ship non-ELF data ------------------------------
+  libgtk-3-0: gtk3
+  libgtk-4-1: gtk4
+  libgtk2.0-0: gtk2
+  libqt5gui5: qt5-qtbase-gui
+  libqt6gui6: qt6-qtbase-gui
+
+  # --- compat shims -------------------------------------------------------
+  # Fedora ships libcrypt.so.2; Debian binaries linked against libcrypt.so.1
+  # need the compat package, which is installable but not default.
+  libcrypt1: libxcrypt-compat
+
+  # --- implicitly satisfied on any Fedora system; drop rather than map ----
+  libc6: null
+  libc-bin: null
+  libgcc-s1: null
+  libstdc++6: null
+  zlib1g: null
+  multiarch-support: null
+  dpkg: null
+  install-info: null
+  debconf: null
+  dconf-gsettings-backend: null
+  init-system-helpers: null
+  lsb-base: null
+  apt: null
+  sudo: null
+
+# Debian package names to silently drop wherever they appear.
+ignore:
+  - debconf-2.0
+  - default-mta
+  - mail-transport-agent

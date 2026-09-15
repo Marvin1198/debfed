@@ -1,0 +1,36 @@
+## Submit to COPR, but only for a release that already passed every gate
+## and whose RPM built and installed cleanly.
+
+name: copr
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    name: submit to copr
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: dnf install -y --setopt=install_weak_deps=False copr-cli
+      - name: Configure copr credentials
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          if [ -z "$COPR_CONFIG" ]; then
+            echo "::error::COPR_CONFIG secret is not set"
+            exit 1
+          fi
+          mkdir -p ~/.config
+          printf '%s' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+      - name: Submit build
+        run: copr-cli build --nowait debfed packaging/debfed.spec

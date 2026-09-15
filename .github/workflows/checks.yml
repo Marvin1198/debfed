@@ -1,0 +1,460 @@
+## Every quality and security gate, in one reusable workflow.
+##
+## Called by ci.yml on push/PR and by release.yml BEFORE any artifact is
+## built. A tagged release cannot publish unless all of this is green --
+## see `needs: checks` in release.yml.
+##
+## Action versions: Node 20 was removed from GitHub runners on 2026-09-16,
+## so checkout/setup-python/upload-artifact are pinned to the Node 24
+## majors (v6/v6/v7). Do not downgrade these to v4/v5.
+
+name: checks
+
+on:
+  workflow_call:
+    inputs:
+      fedora-image:
+        description: Fedora container image to test against
+        type: string
+        default: "fedora:latest"
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  FORCE_COLOR: "1"
+
+jobs:
+
+  # ------------------------------------------------------------------
+  # 1. Code quality. Cheap and fast, so it runs unblocked.
+  # ------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install ruff mypy types-PyYAML
+
+      - name: Ruff (annotates inline on the diff)
+        run: ruff check --output-format=github src/ tests/
+
+      - name: Mypy (advisory)
+        id: mypy
+        continue-on-error: true
+        run: mypy src/debfed --ignore-missing-imports --no-strict-optional
+
+      - name: Publish lint results to job summary
+        if: always()
+        run: |
+          {
+            echo "### Code quality"
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| ruff | ${{ job.status }} |"
+            echo "| mypy | ${{ steps.mypy.outcome }} (advisory) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  # 2. Static analysis. Separate job so SARIF still reaches the Security
+  #    tab even when a later gate fails.
+  # ------------------------------------------------------------------
+  sast:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # SARIF upload to Security > Code scanning
+    env:
+      FAIL_ON_MEDIUM: 'true'   # criticals always block; flip this if noisy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          pip install 'bandit[sarif]'
+
+      - name: Run bandit
+        run: bandit -r src/ -f json -o bandit.json --exit-zero
+
+      - name: Annotate and gate on findings
+        run: |
+          # Fail closed: without jq the counts below would default to 0 and
+          # the gate would silently pass. A security gate must never do that.
+          command -v jq >/dev/null || { echo "::error title=gate::jq is missing; refusing to evaluate"; exit 1; }
+          # Default to 0: an empty jq result would make the numeric tests
+          # below fail with "Illegal number" instead of reporting cleanly.
+          test -s bandit.json || { echo "::error title=gate::bandit produced no report"; exit 1; }
+          HIGH=$(jq '[.results[]? | select(.issue_severity=="HIGH")] | length' bandit.json 2>/dev/null || echo 0)
+          MED=$(jq  '[.results[]? | select(.issue_severity=="MEDIUM")] | length' bandit.json 2>/dev/null || echo 0)
+          LOW=$(jq  '[.results[]? | select(.issue_severity=="LOW")] | length' bandit.json 2>/dev/null || echo 0)
+          HIGH=${HIGH:-0}; MED=${MED:-0}; LOW=${LOW:-0}
+
+          jq -r '.results[] | select(.issue_severity=="HIGH")
+            | "::error title=\(.test_id)::\(.filename):\(.line_number) - \(.issue_text)"' \
+            bandit.json | head -n 20
+          jq -r '.results[] | select(.issue_severity=="MEDIUM")
+            | "::warning title=\(.test_id)::\(.filename):\(.line_number) - \(.issue_text)"' \
+            bandit.json | head -n 20
+
+          {
+            echo "### Static analysis: $HIGH high, $MED medium, $LOW low"
+            echo
+            echo "| Severity | Test | File | Line | Issue |"
+            echo "|---|---|---|---|---|"
+            jq -r '.results[] | select(.issue_severity=="HIGH" or .issue_severity=="MEDIUM")
+              | "| \(.issue_severity) | \(.test_id) | \(.filename) | \(.line_number) | \(.issue_text) |"' \
+              bandit.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$HIGH" -gt 0 ]; then
+            echo "Blocking: $HIGH high-severity findings."
+            exit 1
+          fi
+          if [ "$FAIL_ON_MEDIUM" = "true" ] && [ "$MED" -gt 0 ]; then
+            echo "Blocking: $MED medium-severity findings."
+            exit 1
+          fi
+          echo "Gate passed: $HIGH high, $MED medium."
+
+      - name: Re-scan as SARIF for the Security tab
+        if: always()
+        run: bandit -r src/ -f sarif -o bandit.sarif --exit-zero
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+
+  # ------------------------------------------------------------------
+  # 3. Dependency CVEs. Audits the DECLARED dependency set, not the whole
+  #    environment: pip-audit --strict treats "not on PyPI" as a failure
+  #    and debfed itself is unpublished, so auditing the environment would
+  #    block every release for no reason.
+  # ------------------------------------------------------------------
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          pip install pip-audit
+
+      - name: Extract declared dependencies
+        run: |
+          python - <<'PY' > requirements-audit.txt
+          import tomllib, pathlib
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          deps = data["project"].get("dependencies", [])
+          deps += data["project"].get("optional-dependencies", {}).get("dev", [])
+          print("\n".join(deps))
+          PY
+          cat requirements-audit.txt
+
+      - name: Run pip-audit
+        run: pip-audit --strict --format json -r requirements-audit.txt -o audit.json || true
+
+      - name: Annotate and gate on findings
+        run: |
+          command -v jq >/dev/null || { echo "::error title=gate::jq is missing; refusing to evaluate"; exit 1; }
+          test -s audit.json || { echo "::error title=gate::pip-audit produced no report"; exit 1; }
+          COUNT=$(jq '[.dependencies[]? | select((.vulns | length) > 0)] | length' audit.json 2>/dev/null || echo 0)
+          COUNT=${COUNT:-0}
+
+          jq -r '.dependencies[]? | select((.vulns|length)>0) as $d | $d.vulns[]
+            | "::error title=\(.id)::\($d.name) \($d.version) - fixed in \(.fix_versions[0] // "no fix available")"' \
+            audit.json | head -n 20
+
+          {
+            echo "### Dependency audit: $COUNT vulnerable package(s)"
+            echo
+            if [ "$COUNT" -gt 0 ]; then
+              echo "| Package | Installed | Advisory | Fixed in |"
+              echo "|---|---|---|---|"
+              jq -r '.dependencies[]? | select((.vulns|length)>0) as $d | $d.vulns[]
+                | "| \($d.name) | \($d.version) | \(.id) | \(.fix_versions[0] // "unfixed") |"' \
+                audit.json
+            else
+              echo "No known vulnerabilities in declared dependencies."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Blocking: $COUNT vulnerable dependencies."
+            exit 1
+          fi
+          echo "Gate passed: no known CVEs."
+
+  # ------------------------------------------------------------------
+  # 4. Secret scan over full history.
+  # ------------------------------------------------------------------
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # gitleaks needs full history
+          persist-credentials: false
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # ------------------------------------------------------------------
+  # 5. Unit tests on two Fedora releases. rpmdeps behaviour is the whole
+  #    premise of this tool, so it is tested against more than one rpm.
+  # ------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ 'fedora:latest', 'fedora:43' ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            python3 python3-pip python3-pyyaml python3-pytest \
+            rpm-build zstd findutils tar jq
+
+      - name: Install debfed
+        run: pip install -e .
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -v --tb=short --junit-xml=results.xml
+
+      - name: Publish test results to job summary
+        if: always()
+        run: |
+          {
+            echo "### Tests (${{ matrix.image }})"
+            echo '```'
+            python -m pytest tests/ -q --tb=no 2>&1 | tail -n 5
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ strategy.job-index }}
+          path: results.xml
+
+  # ------------------------------------------------------------------
+  # 6. THE security gate. Live exploits against the real CLI, not mocked
+  #    unit tests. Every case here achieved code execution or an
+  #    out-of-tree write against an earlier revision of this code.
+  # ------------------------------------------------------------------
+  exploit-suite:
+    runs-on: ubuntu-latest
+    container: ${{ inputs.fedora-image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            python3 python3-pip python3-pyyaml rpm-build zstd findutils
+
+      - name: Install debfed
+        run: pip install -e .
+
+      - name: Run exploit suite
+        run: python tests/attack_suite.py 2>&1 | tee exploit.log
+
+      - name: Run security regression tests
+        run: |
+          python -m pytest tests/ -v -k \
+            "injection or traversal or escape or refused or hostile or setuid or symlink or truncated or implausible"
+
+      - name: Publish exploit results to job summary
+        if: always()
+        run: |
+          {
+            echo "### Exploit suite"
+            echo
+            echo '```'
+            sed 's/\x1b\[[0-9;]*m//g' exploit.log || echo "suite did not produce output"
+            echo '```'
+            echo
+            echo "Each case reproduced against an earlier revision. See SECURITY.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  # 7. Does the output actually work? Converts a real Debian package and
+  #    asserts the specific failure modes debfed exists to avoid.
+  # ------------------------------------------------------------------
+  package-integrity:
+    runs-on: ubuntu-latest
+    container: ${{ inputs.fedora-image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            python3 python3-pip python3-pyyaml rpm-build rpmlint \
+            zstd findutils curl jq
+
+      - name: Install debfed
+        run: pip install -e .
+
+      - name: Convert a real Debian package
+        run: |
+          curl -sSLo /tmp/jq.deb \
+            http://archive.ubuntu.com/ubuntu/pool/main/j/jq/jq_1.7.1-3build1_amd64.deb
+          debfed inspect /tmp/jq.deb
+          debfed build /tmp/jq.deb -o /tmp/out
+
+      - name: Gate on RPM correctness
+        run: |
+          FAILED=0
+          RPM=$(ls /tmp/out/*.rpm)
+
+          # (a) claiming a filesystem-owned directory is exactly what makes
+          #     alien output refuse to install
+          for d in /usr /usr/bin /usr/lib64 /usr/share /usr/share/man/man1; do
+            if rpm -qpl "$RPM" | grep -qx "$d"; then
+              echo "::error title=shared-directory::RPM claims $d, owned by filesystem"
+              FAILED=1
+            fi
+          done
+
+          # (b) dependencies must come from SONAMEs, not Debian package names
+          if ! rpm -qp --requires "$RPM" | grep -q 'libc\.so\.6'; then
+            echo "::error title=no-soname-requires::dependency generator produced nothing"
+            FAILED=1
+          fi
+
+          # (c) a bundled library must not advertise itself system-wide
+          if rpm -qp --provides "$RPM" | grep -q '^lib.*\.so'; then
+            echo "::error title=provides-leak::RPM leaks a bundled library provide"
+            FAILED=1
+          fi
+
+          REQS=$(rpm -qp --requires "$RPM" | grep -c '\.so' || echo 0)
+          LEAK=$(rpm -qp --provides "$RPM" | grep -c '\.so' || echo 0)
+
+          {
+            echo "### Package integrity"
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Filesystem-owned dirs claimed | $([ "$FAILED" -eq 0 ] && echo none || echo SEE-LOG) |"
+            echo "| SONAME requires generated | $REQS |"
+            echo "| Bundled provides leaked | $LEAK |"
+            echo
+            echo "<details><summary>Generated requires</summary>"
+            echo
+            echo '```'
+            rpm -qp --requires "$RPM"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $FAILED
+
+      - name: Lint the generated package
+        run: rpmlint /tmp/out/*.rpm || true
+
+      - name: Verify install and removal
+        run: |
+          dnf install -y /tmp/out/*.rpm
+          test -x /usr/bin/jq
+          rpm -q jq
+          dnf remove -y jq
+          echo "install/remove clean"
+
+      - name: Verify the refusal engine
+        run: |
+          curl -sSLo /tmp/libc.deb \
+            http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8.7_amd64.deb
+          if debfed inspect /tmp/libc.deb; then
+            echo "::error title=refusal-engine::libc6 was NOT refused"
+            exit 1
+          fi
+          echo "Refusal engine: libc6 correctly refused." >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  # 8. Single required status. Branch protection and release.yml depend on
+  #    this one job, so adding a gate above never means editing them.
+  # ------------------------------------------------------------------
+  gate:
+    name: all checks passed
+    runs-on: ubuntu-latest
+    needs: [ lint, sast, dependency-audit, secrets, test, exploit-suite, package-integrity ]
+    if: always()
+    steps:
+      - name: Verify every gate succeeded
+        run: |
+          RESULTS='${{ join(needs.*.result, " ") }}'
+          echo "upstream results: $RESULTS"
+          FAILED=0
+          for r in $RESULTS; do
+            [ "$r" = "success" ] || FAILED=1
+          done
+
+          {
+            echo "### Gate"
+            echo
+            if [ "$FAILED" -eq 0 ]; then
+              echo "All checks passed. Release may proceed."
+            else
+              echo "One or more checks failed. Release is blocked."
+              echo
+              echo '```'
+              echo "$RESULTS"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error title=gate::a required check did not pass"
+            exit 1
+          fi
+          echo "All gates green."

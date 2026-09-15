@@ -1,0 +1,79 @@
+.TH DEBFED 1 "September 2026" "debfed" "User Commands"
+.SH NAME
+debfed \- install Debian-targeted applications on Fedora as native RPMs
+.SH SYNOPSIS
+.B debfed
+.I COMMAND
+[\fIOPTIONS\fR] \fIARGS\fR
+.SH DESCRIPTION
+.B debfed
+converts vendor-distributed
+.I .deb
+application packages into native RPMs and installs them through dnf, so
+the application is owned by rpm, appears in
+.BR "rpm \-qa" ,
+and is removable with
+.BR dnf .
+No container, chroot or virtual machine is involved.
+.PP
+Debian's
+.B Depends:
+field is discarded. Requirements are derived instead from the payload's
+ELF headers using rpm's own dependency generator, which emits
+capabilities in Fedora's native syntax; SONAMEs are identical across
+distributions where package names are not.
+.PP
+.B debfed
+is not a general Debian-to-Fedora converter. Base system packages,
+kernel modules, and packages requiring dpkg semantics are refused with a
+stated reason.
+.SH COMMANDS
+.TP
+.BI inspect " DEB..."
+Report requirements, chosen strategy and any refusals. Read-only.
+.TP
+.BI build " DEB"
+Produce an RPM without installing it.
+.TP
+.BI install " DEB"
+Convert and install. A dnf transaction preview is always shown first.
+.TP
+.BI remove " NAME"
+Remove an installed package via dnf.
+.TP
+.B map
+View and edit the dependency mapping database.
+.SH OPTIONS
+.TP
+.B \-\-json
+Machine-readable output (\fBinspect\fR only).
+.TP
+.B \-\-offline
+Skip dnf resolution. No strategy will be chosen.
+.TP
+.B \-\-dry\-run
+Stop after the transaction preview (\fBinstall\fR only).
+.TP
+.B \-y ", " \-\-yes
+Skip the confirmation prompt. The dry run still runs.
+.TP
+.BI \-\-map\-file " PATH"
+Additional mapping database, taking highest precedence.
+.SH FILES
+.TP
+.I ~/.config/debfed/mappings.yaml
+User dependency mappings, overriding the shipped database.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Package refused, or user aborted.
+.TP
+.B 2
+Error reading the package or running a required tool.
+.SH SEE ALSO
+.BR dnf (8),
+.BR rpm (8),
+.BR rpmbuild (8)

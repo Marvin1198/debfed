@@ -431,8 +431,9 @@ jobs:
     if: always()
     steps:
       - name: Verify every gate succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          RESULTS='${{ join(needs.*.result, " ") }}'
           echo "upstream results: $RESULTS"
           FAILED=0
           for r in $RESULTS; do

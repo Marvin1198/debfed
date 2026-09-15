@@ -67,17 +67,17 @@ def guess_license(deb: Deb) -> str:
     rpm requires a License tag. Guessing wrong is better than failing to
     build, but the value is reported so the user can correct it.
     """
-    for candidate in deb.payload_dir.rglob("usr/share/doc/*/copyright"):
+    for copyright_file in deb.payload_dir.rglob("usr/share/doc/*/copyright"):
         try:
-            text = candidate.read_text(errors="replace")
+            text = copyright_file.read_text(errors="replace")
         except OSError:
             continue
         m = re.search(r"^License:\s*(.+)$", text, re.MULTILINE)
         if m:
-            candidate = m.group(1).strip().split("\n")[0][:64]
+            declared = m.group(1).strip().split("\n")[0][:64]
             # Read out of the payload, so untrusted.
-            if re.match(r"^[A-Za-z0-9][A-Za-z0-9+.\-\s()]*$", candidate):
-                return candidate
+            if re.match(r"^[A-Za-z0-9][A-Za-z0-9+.\-\s()]*$", declared):
+                return declared
         for token in ("GPL-3", "GPL-2", "LGPL-3", "LGPL-2", "MIT", "BSD-3",
                       "BSD-2", "Apache-2.0", "MPL-2.0", "ISC"):
             if token in text:

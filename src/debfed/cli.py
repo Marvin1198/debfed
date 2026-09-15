@@ -195,9 +195,9 @@ def as_dict(an: Analysis) -> dict:
 def cmd_inspect(args: argparse.Namespace) -> int:
     results, worst = [], 0
     for deb_path in args.deb:
-        with tempfile.TemporaryDirectory(prefix="debfed-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="debfed-") as tmpdir:
             try:
-                an = analyse(deb_path, Path(tmp), offline=args.offline,
+                an = analyse(deb_path, Path(tmpdir), offline=args.offline,
                              map_file=args.map_file)
             except (DebError, ResolveError, UnsafeInput) as exc:
                 print(f"error: {exc}", file=sys.stderr)
@@ -224,8 +224,8 @@ def _build(an: Analysis, workdir: Path, quiet: bool):
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    with tempfile.TemporaryDirectory(prefix="debfed-") as tmp:
-        tmp = Path(tmp)
+    with tempfile.TemporaryDirectory(prefix="debfed-") as tmpdir:
+        tmp = Path(tmpdir)
         try:
             an = analyse(args.deb, tmp, offline=args.offline,
                          map_file=args.map_file)
@@ -267,8 +267,8 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    with tempfile.TemporaryDirectory(prefix="debfed-") as tmp:
-        tmp = Path(tmp)
+    with tempfile.TemporaryDirectory(prefix="debfed-") as tmpdir:
+        tmp = Path(tmpdir)
         try:
             an = analyse(args.deb, tmp, map_file=args.map_file)
         except (DebError, ResolveError, UnsafeInput) as exc:

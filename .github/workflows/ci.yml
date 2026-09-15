@@ -58,9 +58,8 @@ jobs:
       - name: Ruff (annotates inline on the diff)
         run: ruff check --output-format=github src/ tests/
 
-      - name: Mypy (advisory)
+      - name: Mypy
         id: mypy
-        continue-on-error: true
         run: mypy src/debfed --ignore-missing-imports --no-strict-optional
 
       - name: Publish lint results to job summary
@@ -72,7 +71,7 @@ jobs:
             echo "| Check | Result |"
             echo "|---|---|"
             echo "| ruff | ${{ job.status }} |"
-            echo "| mypy | ${{ steps.mypy.outcome }} (advisory) |"
+            echo "| mypy | ${{ steps.mypy.outcome }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ------------------------------------------------------------------

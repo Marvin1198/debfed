@@ -12,6 +12,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -701,3 +702,27 @@ def test_setuid_bits_are_recorded_even_though_dropped(tmp: Path):
     assert any("chrome-sandbox" in p for p in d.payload_setuid)
     extracted = d.payload_dir / "opt/app/chrome-sandbox"
     assert not extracted.stat().st_mode & 0o4000   # bit actually dropped
+
+
+def test_attack_suite_refuses_to_run_without_debfed(tmp: Path):
+    """The attack suite must not report success when it tested nothing.
+
+    A missing marker file only proves an attack failed if debfed actually
+    executed. An earlier revision could not tell the two apart, so a
+    broken install printed "all 9 attacks blocked" -- a green security
+    gate that had run no attacks at all.
+    """
+    suite = Path(__file__).parent / "attack_suite.py"
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    # Empty PATH entry for the console script, and a cwd with no package.
+    env["PATH"] = "/nonexistent"
+    proc = subprocess.run(
+        [sys.executable, str(suite)],
+        capture_output=True, text=True, cwd=tmp, env=env, timeout=300,
+    )
+    assert proc.returncode == 2, (
+        f"expected exit 2 (unusable), got {proc.returncode}\n{proc.stdout}"
+    )
+    assert "SUITE UNUSABLE" in proc.stdout + proc.stderr
+    assert "blocked" not in proc.stdout

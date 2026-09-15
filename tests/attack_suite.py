@@ -75,27 +75,60 @@ def control(pkg: str, **extra: str) -> str:
     return head
 
 
+# Output that means debfed never ran, rather than ran and refused. Without
+# this distinction the suite reports "blocked" for every case when the tool
+# is simply missing -- an attack suite that passes while testing nothing.
+DID_NOT_RUN = (
+    "No module named",
+    "command not found",
+    "ModuleNotFoundError",
+    "ImportError",
+    "Traceback (most recent call last)",
+)
+
+
+class SuiteUnusable(Exception):
+    """debfed could not be invoked; results would be meaningless."""
+
+
 class Suite:
-    def __init__(self, workdir: Path):
+    def __init__(self, workdir: Path, invocation: list[str]):
         self.workdir = workdir
+        self.invocation = invocation
         self.results: list[tuple[str, bool, str]] = []
 
     def run_debfed(self, *args: str) -> tuple[int, str]:
         proc = subprocess.run(
-            [sys.executable, "-m", "debfed", *args],
+            [*self.invocation, *args],
             capture_output=True, text=True, timeout=300,
         )
         return proc.returncode, (proc.stdout + proc.stderr)
 
     def check(self, name: str, deb: Path, markers: list[Path]) -> None:
-        """Build the hostile package; assert no marker was created."""
+        """Build the hostile package; assert no marker was created.
+
+        A missing marker only proves the attack failed if debfed actually
+        executed. Verify that first -- otherwise a broken install reports
+        a clean sweep.
+        """
         for marker in markers:
             if marker.exists():
                 marker.unlink()
         out_dir = self.workdir / "out"
-        _, output = self.run_debfed(
+        code, output = self.run_debfed(
             "build", "--offline", "-o", str(out_dir), str(deb)
         )
+
+        if code == 127 or any(sig in output for sig in DID_NOT_RUN):
+            raise SuiteUnusable(
+                f"debfed failed to execute (exit {code}):\n"
+                + "\n".join(output.strip().splitlines()[-5:])
+            )
+        # debfed exits 0 (built) or 1 (refused). Anything else means it
+        # crashed rather than reached a verdict.
+        if code not in (0, 1, 2):
+            raise SuiteUnusable(f"debfed exited {code}, which is not a verdict")
+
         escaped = [m for m in markers if m.exists()]
         detail = output.strip().splitlines()[-1][:70] if output.strip() else ""
         self.results.append((name, not escaped, detail))
@@ -119,7 +152,43 @@ class Suite:
         return 1 if failures else 0
 
 
+def resolve_invocation() -> list[str]:
+    """Find a working way to run debfed, or refuse to proceed.
+
+    pipx installs into its own venv, so `python3 -m debfed` fails even
+    though the `debfed` console script works. Try both, and verify the
+    result actually responds before running a single attack.
+    """
+    candidates = [
+        [sys.executable, "-m", "debfed"],
+        ["debfed"],
+    ]
+    for inv in candidates:
+        try:
+            proc = subprocess.run(
+                [*inv, "--version"], capture_output=True, text=True, timeout=60
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0 and "debfed" in proc.stdout:
+            print(f"  using: {' '.join(inv)}  ({proc.stdout.strip()})")
+            return inv
+    raise SuiteUnusable(
+        "debfed is not runnable. Tried:\n"
+        + "\n".join("  " + " ".join(c) for c in candidates)
+        + "\n\nInstall it first:  pipx install --system-site-packages .\n"
+        "Refusing to run the attack suite -- it would report every case as\n"
+        "blocked simply because nothing executed."
+    )
+
+
 def main() -> int:
+    try:
+        invocation = resolve_invocation()
+    except SuiteUnusable as exc:
+        print(f"\n{RED}SUITE UNUSABLE{RESET}\n{exc}\n", file=sys.stderr)
+        return 2
+
     with tempfile.TemporaryDirectory(prefix="debfed-attacks-") as tmp:
         tmp = Path(tmp)
         marker_dir = tmp / "markers"
@@ -127,7 +196,7 @@ def main() -> int:
         outside = tmp / "outside"
         outside.mkdir()
 
-        suite = Suite(tmp)
+        suite = Suite(tmp, invocation)
         m = lambda n: marker_dir / n  # noqa: E731
 
         # 1. rpm expands %(cmd) through /bin/sh at spec parse time.
@@ -243,4 +312,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SuiteUnusable as exc:
+        print(f"\n{RED}SUITE UNUSABLE{RESET}\n{exc}\n", file=sys.stderr)
+        sys.exit(2)

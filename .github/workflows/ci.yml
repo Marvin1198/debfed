@@ -316,7 +316,8 @@ jobs:
       - name: Install dependencies
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            python3 python3-pip python3-pyyaml rpm-build zstd findutils
+            python3 python3-pip python3-pyyaml python3-pytest \
+            rpm-build zstd findutils
 
       - name: Install debfed
         run: python3 -m pip install -e .
@@ -371,25 +372,31 @@ jobs:
 
       - name: Fetch a real Debian package
         run: |
-          # Resolve the current pool filename rather than pinning a version:
-          # Ubuntu drops superseded builds from the pool and a pinned URL 404s.
           set -o pipefail
-          BASE=http://archive.ubuntu.com/ubuntu/pool/main/j/jq/
+          # `tree` is the subject because its only dependency is glibc.
+          # `jq` is NOT usable: the converted package requires libjq.so.1,
+          # whose only Fedora provider is Fedora's own `jq`, which conflicts
+          # by name -- an unsatisfiable loop that says nothing about whether
+          # debfed works.
+          #
+          # Resolve the current pool filename rather than pinning a version:
+          # Ubuntu drops superseded builds and a pinned URL eventually 404s.
+          BASE=http://archive.ubuntu.com/ubuntu/pool/universe/t/tree/
           FILE=$(curl -sSf "$BASE" \
-            | grep -o 'jq_[^"]*_amd64\.deb' | sort -u | tail -n1)
-          # An empty result would make curl fetch the directory listing and
-          # save the HTML as jq.deb, failing confusingly three steps later.
-          test -n "$FILE" || { echo "::error::could not resolve a jq .deb in the pool"; exit 1; }
+            | grep -o 'tree_[^"]*_amd64\.deb' | sort -u | tail -n1)
+          # An empty result would make curl save the directory listing as the
+          # .deb, failing confusingly three steps later.
+          test -n "$FILE" || { echo "::error::could not resolve a tree .deb"; exit 1; }
           echo "resolved: $FILE"
-          curl -sSfLo /tmp/jq.deb "$BASE$FILE"
-          file /tmp/jq.deb | grep -q 'Debian binary package' \
+          curl -sSfLo /tmp/test.deb "$BASE$FILE"
+          file /tmp/test.deb | grep -q 'Debian binary package' \
             || { echo "::error::downloaded file is not a .deb"; exit 1; }
-          ls -la /tmp/jq.deb
+          ls -la /tmp/test.deb
 
       - name: Convert it
         run: |
-          debfed inspect /tmp/jq.deb
-          debfed build /tmp/jq.deb -o /tmp/out
+          debfed inspect /tmp/test.deb
+          debfed build /tmp/test.deb -o /tmp/out
 
       - name: Gate on RPM correctness
         run: |
@@ -444,15 +451,12 @@ jobs:
 
       - name: Verify install and removal
         run: |
-          # Fedora ships its own jq. Installing a converted one on top is a
-          # genuine file conflict, not a debfed bug -- clear it first so the
-          # test measures what it means to measure.
-          dnf remove -y jq 2>/dev/null || true
-          rpm -q jq && { echo "::error::jq still installed"; exit 1; } || true
           dnf install -y /tmp/out/*.rpm
-          test -x /usr/bin/jq
-          rpm -q jq
-          dnf remove -y jq
+          test -x /usr/bin/tree
+          rpm -q tree
+          /usr/bin/tree --version
+          dnf remove -y tree
+          test ! -e /usr/bin/tree || { echo "::error::removal left files behind"; exit 1; }
           echo "install/remove clean"
 
       - name: Verify the refusal engine

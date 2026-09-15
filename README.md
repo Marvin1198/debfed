@@ -15,20 +15,20 @@ $ debfed install claude-desktop_1.2.3_amd64.deb
 ### From a release (recommended)
 
 ```bash
-sudo dnf install https://github.com/Marvin1198/debfed/releases/latest/download/debfed-0.1.0-1.fc44.noarch.rpm
+sudo dnf install https://github.com/USER/debfed/releases/latest/download/debfed-0.1.0-1.fc44.noarch.rpm
 ```
 
 ### From COPR
 
 ```bash
-sudo dnf copr enable Marvin1198/debfed
+sudo dnf copr enable USER/debfed
 sudo dnf install debfed
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/Marvin1198/debfed
+git clone https://github.com/USER/debfed
 cd debfed
 sudo dnf install rpm-build python3-pyyaml
 pip install --user -e .
@@ -69,6 +69,15 @@ debfed map add fonts-foo foo-fonts
 | Would require bundling a toolkit (GTK, Qt, NSS, mesa) | `LD_LIBRARY_PATH` prefixing breaks the moment the app `dlopen`s a host module |
 | Kernel modules, DKMS, initramfs, bootloader | Built against Debian's kernel |
 | `dpkg-divert`, unknown triggers, debconf, `Pre-Depends` | No rpm semantics exist; emulating them means maintaining a shadow dpkg database |
+
+**Known limitation — self-referential library packages.** If a Debian
+package's binary links a library that Fedora ships *inside the
+same-named package*, the conversion is unsatisfiable: the converted
+`jq` requires `libjq.so.1`, whose only Fedora provider is Fedora's own
+`jq`, which conflicts by name. debfed builds the RPM successfully but
+`dnf` cannot install it. This affects tools that ship their own library
+alongside the binary; vendor applications, which bundle their libraries
+privately, are unaffected.
 
 **debfed is not a general Debian-to-Fedora converter.** For the refused cases, use Distrobox — that is exactly what containers are for.
 

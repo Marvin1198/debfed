@@ -861,3 +861,51 @@ def test_shared_usr_share_dirs_are_never_private(tmp: Path):
         (d / "libthing.so").write_bytes(b"\x7fELF")
     reloc = layout.relocate(payload, tmp / "br")
     assert reloc.private_prefixes == []
+
+
+def test_capability_variants_cover_both_usrmerge_spellings():
+    """Neither spelling is universally right.
+
+    /bin/bash resolves only as /usr/bin/bash (rpm records the real path),
+    but /bin/sh resolves only as /bin/sh (it is a symlink to bash, and rpm
+    does not record symlinked paths as file provides -- Fedora carries an
+    explicit Provides: /bin/sh instead). Rewriting unconditionally fixes
+    the first and breaks the second.
+    """
+    from debfed.depsolve import capability_variants
+
+    assert capability_variants("/bin/sh") == ["/bin/sh", "/usr/bin/sh"]
+    assert capability_variants("/bin/bash") == ["/bin/bash", "/usr/bin/bash"]
+    assert capability_variants("/usr/bin/env") == ["/usr/bin/env", "/bin/env"]
+    # non-path capabilities are left alone
+    assert capability_variants("libc.so.6()(64bit)") == ["libc.so.6()(64bit)"]
+
+
+def test_repoquery_format_string_terminates_lines():
+    """dnf repoquery --qf '%{name}' with no newline concatenates providers.
+
+    Two packages providing one capability then became a single nonexistent
+    name such as "libcurllibcurl-minimal", which was recorded as the
+    resolving package.
+    """
+    import inspect as _inspect
+
+    from debfed import depsolve
+
+    source = _inspect.getsource(depsolve._repoquery_one)
+    assert '"%{name}\\n"' in source, "repoquery format string must end with a newline"
+
+
+def test_multiple_providers_are_parsed_separately():
+    from unittest import mock
+
+    from debfed.depsolve import _repoquery_one
+
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="libcurl\nlibcurl-minimal\n", stderr=""
+    )
+    with mock.patch("debfed.depsolve.subprocess.run", return_value=fake), \
+         mock.patch("debfed.depsolve._dnf_bin", return_value="dnf"):
+        assert _repoquery_one("libcurl.so.4()(64bit)") == [
+            "libcurl", "libcurl-minimal",
+        ]

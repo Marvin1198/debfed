@@ -145,26 +145,54 @@ def scan_provides(buildroot: Path) -> list[str]:
 USRMERGE_PREFIXES = ("/bin/", "/sbin/", "/lib/", "/lib64/")
 
 
-def normalise_capability(cap: str) -> str:
-    """Rewrite a file-path capability into its usr-merged form.
+def capability_variants(cap: str) -> list[str]:
+    """Every spelling of a capability worth querying, most likely first.
 
-    Fedora is usr-merged: /bin is a symlink to /usr/bin, and rpm records
-    file provides under the real path. A requirement on /bin/bash is
-    therefore unsatisfiable as written even though bash is installed.
+    Fedora is usr-merged: /bin is a symlink to /usr/bin and rpm records
+    most file provides under the real path, so /bin/bash must be looked
+    up as /usr/bin/bash.
+
+    But the rewrite is not universally correct. /usr/bin/sh is itself a
+    symlink to bash, and rpm does not record symlinked paths as file
+    provides -- Fedora instead carries an explicit `Provides: /bin/sh` on
+    bash. Rewriting that one makes it unsatisfiable when the original
+    would have resolved.
+
+    Rather than guess which convention applies to a given path, try both
+    and treat the capability as satisfied if either resolves.
     """
+    variants = [cap]
+    for prefix in USRMERGE_PREFIXES:
+        if cap.startswith(prefix):
+            variants.append("/usr" + cap)
+            break
+    else:
+        for prefix in USRMERGE_PREFIXES:
+            usr_form = "/usr" + prefix
+            if cap.startswith(usr_form):
+                variants.append(cap[len("/usr"):])
+                break
+    return variants
+
+
+def normalise_capability(cap: str) -> str:
+    """The usr-merged spelling of a capability. See capability_variants."""
     for prefix in USRMERGE_PREFIXES:
         if cap.startswith(prefix):
             return "/usr" + cap
     return cap
 
 
-def _repoquery(cap: str) -> list[str]:
+def _repoquery_one(spec: str) -> list[str]:
     proc = subprocess.run(
         [
             _dnf_bin(), "repoquery",
             "--quiet",
-            "--qf", "%{name}",
-            "--whatprovides", normalise_capability(cap),
+            # The trailing newline is essential: without it dnf writes every
+            # matching package name onto one line, and two providers become
+            # a single nonexistent package called "libcurllibcurl-minimal".
+            "--qf", "%{name}\n",
+            "--whatprovides", spec,
         ],
         capture_output=True,
         text=True,
@@ -175,6 +203,15 @@ def _repoquery(cap: str) -> list[str]:
         if name and name not in seen:
             seen.append(name)
     return seen
+
+
+def _repoquery(cap: str) -> list[str]:
+    """Resolve a capability, trying each valid spelling of it."""
+    for spec in capability_variants(cap):
+        found = _repoquery_one(spec)
+        if found:
+            return found
+    return []
 
 
 @dataclass

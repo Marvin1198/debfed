@@ -117,6 +117,22 @@ def print_inspect(an: Analysis, verbose: bool = False) -> None:
     for cap in res.unsatisfied:
         w(f"    {_c('MISSING', RED)}  {cap}\n")
 
+    if res.self_satisfied:
+        w(f"  {_c('self-provided', DIM)} {len(res.self_satisfied)} capabilities "
+          f"{_c('come from the payload itself', DIM)}\n")
+        if verbose:
+            for cap in res.self_satisfied:
+                w(f"    {cap}\n")
+
+    if res.foreign:
+        total = sum(len(v) for v in res.foreign.values())
+        kinds = ", ".join(f"{k} x{len(v)}" for k, v in sorted(res.foreign.items()))
+        w(f"  {_c('other arches', DIM)}  {total} binaries skipped ({kinds})\n")
+        if verbose:
+            for kind, paths in sorted(res.foreign.items()):
+                for path in paths[:5]:
+                    w(f"    {kind}: {path}\n")
+
     if res.fedora_packages:
         w(f"\n  {_c('resolves to', DIM)}   {', '.join(res.fedora_packages)}\n")
 
@@ -163,6 +179,16 @@ def print_inspect(an: Analysis, verbose: bool = False) -> None:
     w("\n  ")
     if a.verdict is Verdict.REFUSE:
         w(_c("REFUSED", RED))
+        # A refusal on maintainer scripts says nothing about whether the
+        # dependencies would have resolved. Report both so the user can
+        # see how close the package actually is.
+        if res.checked and res.requires:
+            if res.unsatisfied:
+                w(_c(f"  (dependencies: {len(res.unsatisfied)} unsatisfied "
+                     f"of {len(res.requires)})", DIM))
+            else:
+                w(_c(f"  (dependencies would have resolved: "
+                     f"{len(res.requires)}/{len(res.requires)})", DIM))
     elif a.verdict is Verdict.UNKNOWN:
         w(_c("INDETERMINATE", YELLOW))
     elif a.verdict is Verdict.STRATEGY_A:
@@ -188,6 +214,8 @@ def as_dict(an: Analysis) -> dict:
         "rpm_provides": an.res.provides,
         "satisfied": an.res.satisfied,
         "unsatisfied": an.res.unsatisfied,
+        "self_satisfied": an.res.self_satisfied,
+        "foreign_objects": an.res.foreign,
         "fedora_packages": an.res.fedora_packages,
         "mapped_extras": an.extra_requires,
         "unmapped": an.unmapped,

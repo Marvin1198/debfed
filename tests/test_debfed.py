@@ -762,3 +762,102 @@ def test_attack_suite_canary_catches_a_broken_toolchain(tmp: Path):
     assert proc.returncode == 2, f"expected 2, got {proc.returncode}\n{combined}"
     assert "SUITE UNUSABLE" in combined
     assert "attacks blocked" not in combined
+
+
+# =====================================================================
+# Regressions from converting a real Electron application (VSCodium).
+# Each of these reported a dependency as missing when it was not, or
+# refused a package that should have converted.
+# =====================================================================
+
+
+def _elf(machine: int, bits64: bool = True) -> bytes:
+    """Minimal ELF header with a given e_machine."""
+    header = bytearray(64)
+    header[0:4] = b"\x7fELF"
+    header[4] = 2 if bits64 else 1
+    header[5] = 1                       # little endian
+    header[18:20] = machine.to_bytes(2, "little")
+    return bytes(header)
+
+
+def test_foreign_architecture_binaries_are_not_scanned(tmp: Path):
+    """Vendor packages bundle ARM and ppc64 helpers.
+
+    Scanning them yields ld-linux-aarch64.so.1 and friends, which no
+    x86_64 host can satisfy -- they look like missing dependencies
+    instead of files for a different CPU.
+    """
+    from debfed.elf import partition_by_arch
+
+    (tmp / "x86").write_bytes(_elf(0x3E))
+    (tmp / "arm64").write_bytes(_elf(0xB7))
+    (tmp / "armhf").write_bytes(_elf(0x28))
+    (tmp / "data.json").write_bytes(b"{}")
+
+    ours, foreign = partition_by_arch(
+        [tmp / "x86", tmp / "arm64", tmp / "armhf", tmp / "data.json"], "x86_64"
+    )
+    names = {p.name for p in ours}
+    assert names == {"x86", "data.json"}, names
+    assert set(foreign) == {"aarch64", "arm"}
+
+
+def test_old_glibc_symbols_are_not_version_skew():
+    """GLIBC_2.2.4 is ancient, not futuristic.
+
+    The x86_64 glibc symbol namespace starts at GLIBC_2.2.5, so lower
+    versions are unsatisfiable while being far older than any current
+    glibc. They come from other-architecture binaries. Treating any
+    unsatisfied libc symbol as skew refuses working packages.
+    """
+    res = Resolution(
+        unsatisfied=[
+            "libc.so.6(GLIBC_2.2)(64bit)",
+            "libc.so.6(GLIBC_2.2.4)(64bit)",
+            "libc.so.6(GLIBC_2.17)(64bit)",
+        ]
+    )
+    assert res.needs_newer_glibc is None
+
+
+def test_genuinely_newer_glibc_is_still_skew():
+    res = Resolution(unsatisfied=["libc.so.6(GLIBC_2.99)(64bit)"])
+    assert res.needs_newer_glibc == "libc.so.6(GLIBC_2.99)(64bit)"
+
+
+def test_usrmerge_file_capabilities_are_normalised():
+    """Fedora records file provides under /usr; /bin is a symlink."""
+    from debfed.depsolve import normalise_capability
+
+    assert normalise_capability("/bin/bash") == "/usr/bin/bash"
+    assert normalise_capability("/sbin/ldconfig") == "/usr/sbin/ldconfig"
+    assert normalise_capability("/usr/bin/env") == "/usr/bin/env"
+    assert normalise_capability("libc.so.6()(64bit)") == "libc.so.6()(64bit)"
+
+
+def test_usr_share_app_tree_is_a_private_prefix(tmp: Path):
+    """Electron apps install under /usr/share/<app>, not only /opt.
+
+    Missing that means their bundled libraries leak into the system
+    dependency namespace.
+    """
+    payload = tmp / "payload"
+    (payload / "usr/share/codium").mkdir(parents=True)
+    (payload / "usr/share/codium/libffmpeg.so").write_bytes(b"\x7fELF")
+    (payload / "usr/share/applications").mkdir(parents=True)
+    (payload / "usr/share/applications/c.desktop").write_bytes(b"[Desktop Entry]\n")
+
+    reloc = layout.relocate(payload, tmp / "br")
+    assert "/usr/share/codium" in reloc.private_prefixes
+    assert "/usr/share/applications" not in reloc.private_prefixes
+
+
+def test_shared_usr_share_dirs_are_never_private(tmp: Path):
+    payload = tmp / "payload"
+    for name in ("icons", "locale", "fonts"):
+        d = payload / "usr/share" / name
+        d.mkdir(parents=True)
+        (d / "libthing.so").write_bytes(b"\x7fELF")
+    reloc = layout.relocate(payload, tmp / "br")
+    assert reloc.private_prefixes == []

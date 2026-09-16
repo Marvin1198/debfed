@@ -236,15 +236,30 @@ def relocate(payload: Path, buildroot: Path) -> Relocation:
 
     result.dirs.sort()
     result.files.sort()
-    result.private_prefixes = _detect_private_prefixes(result.dirs)
+    result.private_prefixes = _detect_private_prefixes(result.dirs, buildroot)
     return result
 
 
-def _detect_private_prefixes(dirs: list[str]) -> list[str]:
+# /usr/share subdirectories that belong to the distribution, never to a
+# single application, so they are not private prefixes no matter what they
+# contain.
+SHARED_USR_SHARE = frozenset({
+    "applications", "icons", "pixmaps", "man", "doc", "metainfo", "mime",
+    "locale", "fonts", "bash-completion", "zsh", "licenses", "dbus-1",
+    "glib-2.0", "appdata", "polkit-1", "info", "themes", "sounds",
+})
+
+
+def _detect_private_prefixes(dirs: list[str], buildroot: Path | None = None) -> list[str]:
     """Find self-contained install roots, e.g. /opt/vendor/app, /usr/lib/app.
 
     Files under these get their Provides filtered -- a bundled libffmpeg.so
     must not advertise itself to the rest of the system.
+
+    /usr/share/<app> counts too when it actually holds shared objects.
+    Electron applications commonly install their whole tree there rather
+    than under /opt (VS Code, VSCodium, Discord), and missing that means
+    their bundled libraries leak into the system namespace.
     """
     prefixes: list[str] = []
     for d in dirs:
@@ -253,11 +268,28 @@ def _detect_private_prefixes(dirs: list[str]) -> list[str]:
             prefixes.append(d)
         elif len(parts) == 3 and parts[:2] in (["usr", "lib"], ["usr", "lib64"]):
             prefixes.append(d)
-        elif len(parts) == 3 and parts[:2] == ["usr", "share"]:
-            continue
+        elif (
+            len(parts) == 3
+            and parts[:2] == ["usr", "share"]
+            and parts[2] not in SHARED_USR_SHARE
+            and buildroot is not None
+            and _holds_shared_objects(buildroot / d.lstrip("/"))
+        ):
+            prefixes.append(d)
+
     # keep only the shallowest of any nested pair
     out: list[str] = []
     for p in sorted(prefixes):
         if not any(p.startswith(o + "/") for o in out):
             out.append(p)
     return out
+
+
+def _holds_shared_objects(path: Path) -> bool:
+    """True if this directory tree contains an ELF shared library."""
+    if not path.is_dir():
+        return False
+    for child in path.rglob("*.so*"):
+        if child.is_file():
+            return True
+    return False

@@ -104,12 +104,30 @@ SAFE_TRIGGERS: dict[str, str] = {
     "update-menus": ":",        # Debian menu system, no Fedora analogue needed
 }
 
+# debconf commands that actually prompt. Sourcing /usr/share/debconf/
+# confmodule is inert on its own, and most db_* verbs only read or write
+# the answer database:
+#
+#   db_get, db_set, db_fset, db_metaget, db_register, db_subst, db_purge,
+#   db_version, db_capb, db_settitle, db_reset, db_stop
+#
+# never display anything. Only db_input queues a question and db_go
+# displays the queue -- and even those fall back to stored defaults under
+# the noninteractive frontend.
+#
+# Refusing a package merely for sourcing confmodule rejects a large class
+# of working vendor packages. VS Code is the canonical example: every
+# db_* call it makes governs one question -- whether to register the
+# Microsoft apt repository -- which debfed strips anyway, and upstream
+# ships an explicit code path for systems with no debconf at all.
+DEBCONF_PROMPTING = re.compile(r"\bdb_(input|go|text)\b")
+DEBCONF_ANY = re.compile(r"\bdb_[a-z]+\b|/usr/share/debconf/confmodule")
+DEBCONF_TEMPLATE = re.compile(r"\bdb_(?:input|get|set)\s+(?:\S+\s+)?([\w./-]+)")
+
 # Maintainer-script constructs with no RPM equivalent.
 SCRIPT_BLOCKERS = (
     (r"\bdpkg-divert\b", "DIVERT", "uses dpkg-divert; rpm has no file diversion"),
     (r"\bdpkg-trigger\b", "TRIGGER", "uses dpkg triggers"),
-    (r"\bdb_input\b|\bdb_get\b|\. /usr/share/debconf", "DEBCONF",
-     "uses debconf for interactive configuration"),
     (r"\bupdate-initramfs\b", "INITRAMFS", "rebuilds the initramfs"),
     (r"\bdkms\b", "DKMS", "builds a kernel module via DKMS"),
     (r"\bupdate-grub\b|\bgrub-mkconfig\b", "GRUB", "modifies the bootloader"),
@@ -163,6 +181,7 @@ def assess(
     res: Resolution,
     *,
     allow_private_prefix: bool = True,
+    strict_scripts: bool = False,
 ) -> Assessment:
     """Decide whether and how this package can be installed."""
     findings: list[Finding] = []
@@ -233,6 +252,37 @@ def assess(
                 ", ".join(unsafe_triggers),
             )
         )
+
+    # ---- debconf -----------------------------------------------------
+    for script_name, body in deb.maintainer_scripts.items():
+        if not DEBCONF_ANY.search(body):
+            continue
+        prompts = DEBCONF_PROMPTING.search(body)
+        templates = sorted(set(DEBCONF_TEMPLATE.findall(body)))
+        shown = ", ".join(templates[:4]) if templates else "unnamed"
+        if prompts:
+            findings.append(
+                Finding(
+                    Severity.FATAL if strict_scripts else Severity.WARN,
+                    "DEBCONF_PROMPT",
+                    f"{script_name}: asks a configuration question during install",
+                    f"question(s): {shown}\n"
+                    "debfed does not run maintainer scripts, so the package's "
+                    "default answer applies -- the same outcome as installing "
+                    "with DEBIAN_FRONTEND=noninteractive. Check the question "
+                    "above if the default matters to you.",
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    Severity.WARN, "DEBCONF_READ",
+                    f"{script_name}: reads the debconf database but never prompts",
+                    f"key(s): {shown}\n"
+                    "No question is displayed; only stored answers are read. "
+                    "Nothing is lost by not running this.",
+                )
+            )
 
     # ---- maintainer scripts ------------------------------------------
     for script_name, body in deb.maintainer_scripts.items():

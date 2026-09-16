@@ -68,7 +68,19 @@ debfed map add fonts-foo foo-fonts
 | Payload needs a **newer** glibc than the host | Bundling glibc requires a matching `ld.so`; out of scope |
 | Would require bundling a toolkit (GTK, Qt, NSS, mesa) | `LD_LIBRARY_PATH` prefixing breaks the moment the app `dlopen`s a host module |
 | Kernel modules, DKMS, initramfs, bootloader | Built against Debian's kernel |
-| `dpkg-divert`, unknown triggers, debconf, `Pre-Depends` | No rpm semantics exist; emulating them means maintaining a shadow dpkg database |
+| `dpkg-divert`, unknown triggers, `Pre-Depends` | No rpm semantics exist; emulating them means maintaining a shadow dpkg database |
+
+**debconf is not a refusal.** A package that sources
+`/usr/share/debconf/confmodule` or calls `db_get` displays nothing, and
+`db_input` falls back to the stored default under a noninteractive
+frontend. Since debfed never runs maintainer scripts, the outcome is the
+same as `DEBIAN_FRONTEND=noninteractive` — so debfed warns, names the
+question, and converts. Use `--strict-scripts` to refuse instead.
+
+VS Code is the case that motivated this: every `db_*` call it makes
+governs one question, whether to register the Microsoft apt repository,
+which debfed strips anyway — and upstream ships an explicit code path for
+systems with no debconf at all.
 
 **Known limitation — self-referential library packages.** If a Debian
 package's binary links a library that Fedora ships *inside the

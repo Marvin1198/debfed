@@ -66,11 +66,12 @@ class Analysis:
 
 
 def analyse(deb_path: Path, workdir: Path, *, offline: bool = False,
-            map_file: Path | None = None) -> Analysis:
+            map_file: Path | None = None,
+            strict_scripts: bool = False) -> Analysis:
     deb = unpack(deb_path, workdir)
     reloc = relocate(deb.payload_dir, workdir / "buildroot")
     res = resolve(reloc.buildroot, offline=offline)
-    assessment = assess(deb, reloc, res)
+    assessment = assess(deb, reloc, res, strict_scripts=strict_scripts)
     scripts = analyse_scripts(deb.maintainer_scripts, deb.triggers, SAFE_TRIGGERS)
 
     db = mapdb.load(map_file)
@@ -240,7 +241,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         with tempfile.TemporaryDirectory(prefix="debfed-") as tmpdir:
             try:
                 an = analyse(deb_path, Path(tmpdir), offline=args.offline,
-                             map_file=args.map_file)
+                             map_file=args.map_file,
+                             strict_scripts=args.strict_scripts)
             except (DebError, UnsafeInput, ValueError) as exc:
                 # The package itself is malformed or hostile: a verdict.
                 print(f"error: {exc}", file=sys.stderr)
@@ -276,7 +278,8 @@ def cmd_build(args: argparse.Namespace) -> int:
         tmp = Path(tmpdir)
         try:
             an = analyse(args.deb, tmp, offline=args.offline,
-                         map_file=args.map_file)
+                         map_file=args.map_file,
+                         strict_scripts=args.strict_scripts)
         except (DebError, UnsafeInput, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -324,7 +327,8 @@ def cmd_install(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="debfed-") as tmpdir:
         tmp = Path(tmpdir)
         try:
-            an = analyse(args.deb, tmp, map_file=args.map_file)
+            an = analyse(args.deb, tmp, map_file=args.map_file,
+                         strict_scripts=args.strict_scripts)
         except (DebError, UnsafeInput, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -443,11 +447,29 @@ def build_parser() -> argparse.ArgumentParser:
                "semantics.",
     )
     p.add_argument("--version", action="version", version=f"debfed {__version__}")
-    p.add_argument("--map-file", type=Path, metavar="PATH",
-                   help="additional mapping database, highest precedence")
+    # Shared options live on a parent parser so they work either before or
+    # after the subcommand. Declaring them only at the top level means
+    # `debfed inspect --map-file X` is an argparse error, which is not what
+    # anyone expects from a CLI.
+    # default=SUPPRESS matters: without it the subparser writes its own
+    # default over a value already parsed before the subcommand, so
+    # `debfed --strict-scripts inspect x.deb` would silently lose the flag.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--map-file", type=Path, metavar="PATH",
+                        default=argparse.SUPPRESS,
+                        help="additional mapping database, highest precedence")
+    common.add_argument("--strict-scripts", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="refuse packages whose maintainer scripts ask a "
+                             "debconf question, instead of warning")
+
+    p.add_argument("--map-file", type=Path, default=None,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--strict-scripts", action="store_true", default=False,
+                   help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="command", required=True)
 
-    insp = sub.add_parser("inspect", help="report requirements, strategy, refusals")
+    insp = sub.add_parser("inspect", parents=[common], help="report requirements, strategy, refusals")
     insp.add_argument("deb", type=Path, nargs="+")
     insp.add_argument("--json", action="store_true")
     insp.add_argument("-v", "--verbose", action="store_true")
@@ -455,7 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="skip dnf resolution; no strategy will be chosen")
     insp.set_defaults(func=cmd_inspect)
 
-    bld = sub.add_parser("build", help="produce an RPM without installing it")
+    bld = sub.add_parser("build", parents=[common], help="produce an RPM without installing it")
     bld.add_argument("deb", type=Path)
     bld.add_argument("-o", "--output", type=Path, metavar="DIR")
     bld.add_argument("--spec-only", action="store_true",
@@ -465,7 +487,7 @@ def build_parser() -> argparse.ArgumentParser:
     bld.add_argument("-v", "--verbose", action="store_true")
     bld.set_defaults(func=cmd_build)
 
-    ins = sub.add_parser("install", help="convert and install (dry run first)")
+    ins = sub.add_parser("install", parents=[common], help="convert and install (dry run first)")
     ins.add_argument("deb", type=Path)
     ins.add_argument("-y", "--yes", action="store_true",
                      help="skip the confirmation prompt (the dry run still runs)")
@@ -506,6 +528,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not hasattr(args, "map_file"):
         args.map_file = None
+    if not hasattr(args, "strict_scripts"):
+        args.strict_scripts = False
     try:
         return args.func(args)
     except KeyboardInterrupt:

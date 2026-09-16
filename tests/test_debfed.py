@@ -909,3 +909,91 @@ def test_multiple_providers_are_parsed_separately():
         assert _repoquery_one("libcurl.so.4()(64bit)") == [
             "libcurl", "libcurl-minimal",
         ]
+
+
+# =====================================================================
+# debconf handling.
+#
+# Refusing every package that touches debconf rejects a large class of
+# working vendor packages. VS Code is the canonical case: every db_* call
+# it makes governs one question -- whether to register the Microsoft apt
+# repository -- which debfed strips anyway, and upstream ships an explicit
+# code path for systems with no debconf at all.
+# =====================================================================
+
+VSCODE_POSTINST = """#!/bin/bash
+rm -f /usr/bin/codium
+update-alternatives --install /usr/bin/editor editor /usr/bin/codium 0
+if hash update-desktop-database 2>/dev/null; then update-desktop-database; fi
+RET='true'
+if [ -e '/usr/share/debconf/confmodule' ]; then
+  . /usr/share/debconf/confmodule
+  db_get codium/add-microsoft-repo || true
+fi
+db_input high codium/add-microsoft-repo || true
+db_go || true
+"""
+
+READ_ONLY_POSTINST = """#!/bin/sh
+. /usr/share/debconf/confmodule
+db_get myapp/setting || true
+db_purge
+"""
+
+
+def test_sourcing_confmodule_alone_is_not_a_refusal(tmp: Path):
+    """Sourcing the library displays nothing; it is inert on its own."""
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"\x7fELF"},
+                   scripts={"postinst": ". /usr/share/debconf/confmodule\n"})
+    d = unpack(deb, tmp / "w")
+    a = assess(d, _empty_reloc(tmp), Resolution())
+    assert a.verdict is not Verdict.REFUSE
+
+
+def test_reading_debconf_without_prompting_is_not_a_refusal(tmp: Path):
+    """db_get and db_purge read or clear state; neither displays anything."""
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"\x7fELF"},
+                   scripts={"postinst": READ_ONLY_POSTINST})
+    d = unpack(deb, tmp / "w")
+    a = assess(d, _empty_reloc(tmp), Resolution())
+    assert a.verdict is not Verdict.REFUSE
+    assert any(f.code == "DEBCONF_READ" for f in a.warnings)
+    assert not any(f.code.startswith("DEBCONF") for f in a.fatal)
+
+
+def test_debconf_prompt_warns_but_converts(tmp: Path):
+    """db_input falls back to the stored default under a noninteractive
+    frontend, which is exactly the outcome of not running the script."""
+    deb = make_deb(tmp, "codium", "1.0-1", {"usr/bin/codium": b"\x7fELF"},
+                   scripts={"postinst": VSCODE_POSTINST})
+    d = unpack(deb, tmp / "w")
+    a = assess(d, _empty_reloc(tmp), Resolution())
+    assert a.verdict is not Verdict.REFUSE
+    prompt = [f for f in a.warnings if f.code == "DEBCONF_PROMPT"]
+    assert prompt, [f.code for f in a.findings]
+    # the question must be named, so the user can judge whether it matters
+    assert "codium/add-microsoft-repo" in prompt[0].detail
+
+
+def test_strict_scripts_restores_the_refusal(tmp: Path):
+    deb = make_deb(tmp, "codium", "1.0-1", {"usr/bin/codium": b"\x7fELF"},
+                   scripts={"postinst": VSCODE_POSTINST})
+    d = unpack(deb, tmp / "w")
+    a = assess(d, _empty_reloc(tmp), Resolution(), strict_scripts=True)
+    assert a.verdict is Verdict.REFUSE
+    assert any(f.code == "DEBCONF_PROMPT" for f in a.fatal)
+
+
+def test_shared_options_work_after_the_subcommand():
+    """`debfed inspect --map-file X` must not be an argparse error."""
+    from debfed.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(
+        ["inspect", "--offline", "--strict-scripts", "--map-file", "/dev/null", "x.deb"]
+    )
+    assert args.strict_scripts is True
+    assert str(args.map_file) == "/dev/null"
+
+    before = parser.parse_args(["--strict-scripts", "inspect", "x.deb"])
+    assert before.strict_scripts is True

@@ -28,6 +28,7 @@ from .layout import UNOWNABLE_DIRS, Relocation
 from .sanitize import (
     safe_name,
     safe_requires,
+    safe_version,
     spec_path,
     spec_text,
     spec_url,
@@ -53,12 +54,13 @@ def split_version(deb_version: str) -> tuple[str | None, str, str]:
     """
     m = _VERSION_RE.match(deb_version.strip())
     if not m:
-        return None, _INVALID_VERSION_CHARS.sub(".", deb_version), "1"
+        return None, safe_version(_INVALID_VERSION_CHARS.sub(".", deb_version)), "1"
     epoch = m.group("epoch")
     version = _INVALID_VERSION_CHARS.sub(".", m.group("upstream"))
     revision = m.group("revision")
     release = _INVALID_VERSION_CHARS.sub(".", revision) if revision else "1"
-    return epoch, version, release
+    return safe_version(epoch) if epoch else None, safe_version(version), \
+        safe_version(release)
 
 
 def guess_license(deb: Deb) -> str:

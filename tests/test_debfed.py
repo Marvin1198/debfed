@@ -704,25 +704,61 @@ def test_setuid_bits_are_recorded_even_though_dropped(tmp: Path):
     assert not extracted.stat().st_mode & 0o4000   # bit actually dropped
 
 
-def test_attack_suite_refuses_to_run_without_debfed(tmp: Path):
+def test_attack_suite_refuses_when_a_tool_is_missing(tmp: Path):
     """The attack suite must not report success when it tested nothing.
 
     A missing marker file only proves an attack failed if debfed actually
-    executed. An earlier revision could not tell the two apart, so a
-    broken install printed "all 9 attacks blocked" -- a green security
-    gate that had run no attacks at all.
+    reached a verdict. An earlier revision could not tell the two apart,
+    so a missing rpmbuild printed "all 9 attacks blocked" -- a green
+    security gate that had run no attacks at all.
     """
     suite = Path(__file__).parent / "attack_suite.py"
     env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
-    # Empty PATH entry for the console script, and a cwd with no package.
-    env["PATH"] = "/nonexistent"
+    env["PATH"] = "/nonexistent"        # hides rpmbuild
     proc = subprocess.run(
         [sys.executable, str(suite)],
         capture_output=True, text=True, cwd=tmp, env=env, timeout=300,
     )
+    combined = proc.stdout + proc.stderr
     assert proc.returncode == 2, (
-        f"expected exit 2 (unusable), got {proc.returncode}\n{proc.stdout}"
+        f"expected exit 2 (unusable), got {proc.returncode}\n{combined}"
     )
-    assert "SUITE UNUSABLE" in proc.stdout + proc.stderr
-    assert "blocked" not in proc.stdout
+    assert "SUITE UNUSABLE" in combined
+    assert "attacks blocked" not in combined
+
+
+def test_attack_suite_rejects_non_verdict_exit_codes():
+    """Exit 2 means debfed could not decide; it is not a clean refusal."""
+    import importlib.util
+    spec_ = importlib.util.spec_from_file_location(
+        "attack_suite", Path(__file__).parent / "attack_suite.py"
+    )
+    mod = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(mod)
+    assert mod.VERDICT_CODES == (0, 1), "exit 2 must not count as a verdict"
+    assert "not found. Install it" in mod.DID_NOT_RUN
+
+
+def test_attack_suite_canary_catches_a_broken_toolchain(tmp: Path):
+    """A present-but-broken rpmbuild must abort the suite, not pass it.
+
+    Checking that a tool exists is not the same as checking it works.
+    The canary converts a known-good package first; if that fails, no
+    later "no marker appeared" result means anything.
+    """
+    fake = tmp / "bin"
+    fake.mkdir()
+    broken = fake / "rpmbuild"
+    broken.write_text("#!/bin/sh\nexit 1\n")
+    broken.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{fake}:{env.get('PATH', '')}"
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "attack_suite.py")],
+        capture_output=True, text=True, env=env, timeout=300,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 2, f"expected 2, got {proc.returncode}\n{combined}"
+    assert "SUITE UNUSABLE" in combined
+    assert "attacks blocked" not in combined

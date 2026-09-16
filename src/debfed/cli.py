@@ -1,4 +1,18 @@
-"""debfed command line interface."""
+"""debfed command line interface.
+
+Exit codes are a contract, not an afterthought -- callers (and debfed's
+own exploit suite) must be able to tell a verdict about the package from
+a failure to reach one:
+
+    0   success: inspected, built or installed
+    1   verdict: the package was refused, or the user aborted
+    2   could not decide: a required tool is missing, or the file is
+        unreadable
+
+Conflating 1 and 2 means a missing rpmbuild looks like a clean refusal,
+which is how an earlier revision of the attack suite reported nine
+blocked exploits while testing nothing.
+"""
 
 from __future__ import annotations
 
@@ -199,7 +213,13 @@ def cmd_inspect(args: argparse.Namespace) -> int:
             try:
                 an = analyse(deb_path, Path(tmpdir), offline=args.offline,
                              map_file=args.map_file)
-            except (DebError, ResolveError, UnsafeInput) as exc:
+            except (DebError, UnsafeInput, ValueError) as exc:
+                # The package itself is malformed or hostile: a verdict.
+                print(f"error: {exc}", file=sys.stderr)
+                worst = max(worst, 1)
+                continue
+            except ResolveError as exc:
+                # Missing rpmdeps/dnf: we could not decide.
                 print(f"error: {exc}", file=sys.stderr)
                 worst = 2
                 continue
@@ -229,7 +249,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         try:
             an = analyse(args.deb, tmp, offline=args.offline,
                          map_file=args.map_file)
-        except (DebError, ResolveError, UnsafeInput) as exc:
+        except (DebError, UnsafeInput, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except ResolveError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
@@ -254,7 +277,10 @@ def cmd_build(args: argparse.Namespace) -> int:
             spec_text = render(plan, an.reloc.buildroot)
             result = build_rpm(spec_text, an.reloc.buildroot, plan.name, tmp,
                                quiet=not args.verbose)
-        except (BuildError, UnsafeInput) as exc:
+        except UnsafeInput as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except BuildError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
@@ -271,7 +297,10 @@ def cmd_install(args: argparse.Namespace) -> int:
         tmp = Path(tmpdir)
         try:
             an = analyse(args.deb, tmp, map_file=args.map_file)
-        except (DebError, ResolveError, UnsafeInput) as exc:
+        except (DebError, UnsafeInput, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except ResolveError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
@@ -300,7 +329,10 @@ def cmd_install(args: argparse.Namespace) -> int:
 
         try:
             _, _, result = _build(an, tmp, quiet=not args.verbose)
-        except (BuildError, UnsafeInput) as exc:
+        except UnsafeInput as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except BuildError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 

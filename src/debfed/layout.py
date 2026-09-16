@@ -203,6 +203,17 @@ def relocate(payload: Path, buildroot: Path) -> Relocation:
                 result.absolute_links["/" + new_rel] = link
             if target.is_symlink() or target.exists():
                 target.unlink()
+            # A link that resolves to itself makes rpm fail to stat the
+            # file with an error that looks like a toolchain fault rather
+            # than a bad package.
+            if not link.startswith("/"):
+                resolved = os.path.normpath(
+                    os.path.join(os.path.dirname("/" + new_rel), link)
+                )
+                if resolved == "/" + new_rel:
+                    raise ValueError(
+                        f"symlink points at itself: /{new_rel} -> {link}"
+                    )
             os.symlink(link, target)
             result.symlinks["/" + new_rel] = link
             continue

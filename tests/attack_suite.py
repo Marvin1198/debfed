@@ -17,6 +17,8 @@ Usage:
 from __future__ import annotations
 
 import io
+import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -84,7 +86,17 @@ DID_NOT_RUN = (
     "ModuleNotFoundError",
     "ImportError",
     "Traceback (most recent call last)",
+    "not found. Install it",     # debfed's own missing-tool message
 )
+
+# debfed exit codes: 0 = built, 1 = verdict about the package, 2 = could
+# not decide. Only 0 and 1 are verdicts.
+#
+# Treating 2 as a verdict is what let a missing rpmbuild report "all 9
+# attacks blocked". The canary below proves the toolchain works before any
+# attack runs, so a 2 here means this specific package broke something --
+# still not a verdict, and still worth aborting over.
+VERDICT_CODES = (0, 1)
 
 
 class SuiteUnusable(Exception):
@@ -124,10 +136,12 @@ class Suite:
                 f"debfed failed to execute (exit {code}):\n"
                 + "\n".join(output.strip().splitlines()[-5:])
             )
-        # debfed exits 0 (built) or 1 (refused). Anything else means it
-        # crashed rather than reached a verdict.
-        if code not in (0, 1, 2):
-            raise SuiteUnusable(f"debfed exited {code}, which is not a verdict")
+        if code not in VERDICT_CODES:
+            raise SuiteUnusable(
+                f"debfed exited {code}, which is not a verdict (0=built, "
+                f"1=refused). It did not reach a decision about this "
+                f"package:\n" + "\n".join(output.strip().splitlines()[-5:])
+            )
 
         escaped = [m for m in markers if m.exists()]
         detail = output.strip().splitlines()[-1][:70] if output.strip() else ""
@@ -182,15 +196,65 @@ def resolve_invocation() -> list[str]:
     )
 
 
-def main() -> int:
-    try:
-        invocation = resolve_invocation()
-    except SuiteUnusable as exc:
-        print(f"\n{RED}SUITE UNUSABLE{RESET}\n{exc}\n", file=sys.stderr)
-        return 2
+def canary(invocation: list[str], workdir: Path) -> None:
+    """Convert a known-good package before trusting any "blocked" result.
 
-    with tempfile.TemporaryDirectory(prefix="debfed-attacks-") as tmp:
-        tmp = Path(tmp)
+    Checking for tools by name is not enough: rpmbuild may be present but
+    broken, a macro may be missing, the temp dir may be unwritable. If a
+    package that MUST convert does not, then every subsequent "no marker
+    appeared" result is meaningless -- debfed never got far enough to be
+    exploited.
+
+    This is the guarantee that makes the per-case checks trustworthy.
+    """
+    good = build_deb(
+        workdir / "canary.deb",
+        control("canaryapp"),
+        {"usr/bin/canaryapp": b"\x7fELF\x02\x01\x01" + b"\x00" * 57},
+    )
+    proc = subprocess.run(
+        [*invocation, "build", "--offline", "-o", str(workdir / "canary-out"),
+         str(good)],
+        capture_output=True, text=True, timeout=300,
+    )
+    if proc.returncode != 0:
+        raise SuiteUnusable(
+            "the canary package failed to convert, so the toolchain is not "
+            "working. Every attack would report as blocked for the wrong "
+            f"reason.\n\nexit {proc.returncode}:\n"
+            + "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-8:])
+        )
+    print("  canary: a known-good package converts correctly")
+
+
+def check_prerequisites() -> None:
+    """Confirm the tools debfed needs are present.
+
+    debfed exits 2 when rpmbuild is missing. Every attack would then be
+    reported as blocked because debfed stopped before it could be
+    exploited -- true, and completely uninformative.
+    """
+    missing = [t for t in ("rpmbuild",) if shutil.which(t) is None
+               and not os.path.isfile(f"/usr/lib/rpm/{t}")]
+    if missing:
+        raise SuiteUnusable(
+            f"missing required tool(s): {', '.join(missing)}\n"
+            "Install with:  dnf install rpm-build\n"
+            "Refusing to run: debfed would abort before reaching any verdict."
+        )
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="debfed-attacks-") as tmpdir:
+        tmp = Path(tmpdir)
+        try:
+            check_prerequisites()
+            invocation = resolve_invocation()
+            canary(invocation, tmp)
+        except SuiteUnusable as exc:
+            print(f"\n{RED}SUITE UNUSABLE{RESET}\n{exc}\n", file=sys.stderr)
+            return 2
+
         marker_dir = tmp / "markers"
         marker_dir.mkdir()
         outside = tmp / "outside"

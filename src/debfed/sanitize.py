@@ -28,6 +28,11 @@ VALID_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9+._-]*$")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 MAX_TAG_LEN = 300
+# rpm builds paths from Name-Version-Release. A pathological version
+# overflows the buildroot path and rpmbuild dies with an unrelated-looking
+# error, which debfed would then report as "could not decide" rather than
+# as a verdict about the package.
+MAX_VERSION_LEN = 64
 MAX_TEXT_LEN = 8000
 MAX_PATH_LEN = 4096
 
@@ -114,6 +119,18 @@ def spec_url(value: str) -> str:
         return ""
     if "%" in value:
         return ""
+    return value
+
+
+def safe_version(value: str) -> str:
+    """Validate a version or release component, or refuse."""
+    if not value:
+        raise UnsafeInput("version is empty")
+    if len(value) > MAX_VERSION_LEN:
+        raise UnsafeInput(
+            f"version component is {len(value)} characters; rpm cannot build "
+            f"a path from it (limit {MAX_VERSION_LEN})"
+        )
     return value
 
 

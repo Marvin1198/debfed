@@ -173,10 +173,15 @@ def resolve_invocation() -> list[str]:
     though the `debfed` console script works. Try both, and verify the
     result actually responds before running a single attack.
     """
+    src = Path(__file__).resolve().parent.parent / "src"
     candidates = [
-        [sys.executable, "-m", "debfed"],
-        ["debfed"],
+        [sys.executable, "-m", "debfed"],        # editable or normal install
+        ["debfed"],                              # console script (pipx)
     ]
+    # Last resort: the working tree itself, so a clean clone can be tested
+    # without installing anything. Same path pytest uses via conftest.py.
+    env_src = {**os.environ, "PYTHONPATH": str(src)} if src.is_dir() else None
+
     for inv in candidates:
         try:
             proc = subprocess.run(
@@ -187,6 +192,20 @@ def resolve_invocation() -> list[str]:
         if proc.returncode == 0 and "debfed" in proc.stdout:
             print(f"  using: {' '.join(inv)}  ({proc.stdout.strip()})")
             return inv
+
+    if env_src is not None:
+        inv = [sys.executable, "-m", "debfed"]
+        try:
+            proc = subprocess.run(
+                [*inv, "--version"], capture_output=True, text=True,
+                timeout=60, env=env_src,
+            )
+            if proc.returncode == 0 and "debfed" in proc.stdout:
+                print(f"  using: working tree at {src}  ({proc.stdout.strip()})")
+                os.environ["PYTHONPATH"] = str(src)
+                return inv
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
     raise SuiteUnusable(
         "debfed is not runnable. Tried:\n"
         + "\n".join("  " + " ".join(c) for c in candidates)

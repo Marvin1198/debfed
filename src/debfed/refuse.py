@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 
-from .deb import Deb
+from .deb import Deb, parse_depends
 from .depsolve import Resolution
 from .layout import Relocation
 
@@ -61,15 +61,30 @@ BASE_PACKAGES = frozenset(
     }
 )
 
+# Paths that belong to the boot chain or the kernel. Installing a Debian
+# build of any of these is unrecoverable.
+#
+# NOTE: /usr/lib/systemd/system is NOT here. That is %{_unitdir} -- the
+# directory Fedora packaging guidelines *require* unit files to be
+# installed into. Treating it as a base path refused every package that
+# ships a service file, which is normal, correct behaviour for a daemon.
 BASE_PATH_PREFIXES = (
     "/boot/",
     "/usr/lib/modules/",
     "/lib/modules/",
-    "/usr/lib/systemd/system/",
     "/usr/lib/dracut/",
     "/usr/lib/kernel/",
     "/etc/grub.d/",
     "/usr/lib/grub/",
+    "/usr/lib/systemd/systemd",      # the binary itself, not the unit dir
+    "/usr/lib/systemd/system-generators/",
+)
+
+# Unit directories, handled with scriptlets rather than refused.
+UNIT_DIRS = (
+    "/usr/lib/systemd/system/",
+    "/usr/lib/systemd/user/",
+    "/etc/systemd/system/",
 )
 
 # Files that mean this package expects dpkg to be the package manager.
@@ -122,7 +137,26 @@ SAFE_TRIGGERS: dict[str, str] = {
 # ships an explicit code path for systems with no debconf at all.
 DEBCONF_PROMPTING = re.compile(r"\bdb_(input|go|text)\b")
 DEBCONF_ANY = re.compile(r"\bdb_[a-z]+\b|/usr/share/debconf/confmodule")
-DEBCONF_TEMPLATE = re.compile(r"\bdb_(?:input|get|set)\s+(?:\S+\s+)?([\w./-]+)")
+# A debconf template name is always owner/question, so requiring the slash
+# is what keeps prose out of the result. Without it, VS Code's comment
+# "even after db_get is called on a first install" yields a question named
+# "called".
+DEBCONF_TEMPLATE = re.compile(
+    r"\bdb_input\s+(?:low|medium|high|critical)\s+([\w.+-]+/[\w./+-]+)"
+    r"|\bdb_(?:get|set|fset|register|subst|metaget)\s+([\w.+-]+/[\w./+-]+)"
+)
+
+
+def debconf_templates(body: str) -> list[str]:
+    """Template names referenced by a script, ignoring comments."""
+    names: set[str] = set()
+    for line in body.splitlines():
+        code = line.split("#", 1)[0]
+        for match in DEBCONF_TEMPLATE.finditer(code):
+            name = match.group(1) or match.group(2)
+            if name:
+                names.add(name)
+    return sorted(names)
 
 # Maintainer-script constructs with no RPM equivalent.
 SCRIPT_BLOCKERS = (
@@ -207,12 +241,27 @@ def assess(
             )
         )
 
-    if deb.fields.get("Pre-Depends"):
+    # Pre-Depends encodes dpkg unpack ordering. For a leaf application it
+    # is almost always a formality -- dpkg, libc6, multiarch-support,
+    # init-system-helpers -- and refusing on its presence rejects large,
+    # perfectly convertible packages such as Chromium. It only matters
+    # when the package pre-depends on something we would have to replace.
+    # Pre-Depends is never fatal on its own. It states unpack ordering --
+    # "dpkg must be configured before I unpack" -- which is universally
+    # true on Debian and meaningless on Fedora. Depending ON a base
+    # package says nothing about whether we would replace one; being a
+    # base package is caught separately by BASE_PACKAGES.
+    #
+    # Refusing on its presence rejected Chromium (Pre-Depends: dpkg).
+    pre_depends = parse_depends(deb.fields.get("Pre-Depends", ""))
+    if pre_depends:
         findings.append(
             Finding(
-                Severity.FATAL, "PRE_DEPENDS",
-                "package declares Pre-Depends",
-                "Pre-Depends encodes dpkg unpack ordering with no rpm analogue.",
+                Severity.WARN, "PRE_DEPENDS",
+                f"package declares Pre-Depends ({len(pre_depends)})",
+                ", ".join(d.name for d in pre_depends[:6])
+                + "\n    dpkg unpack ordering has no rpm analogue; for a leaf "
+                "application this is normally a formality.",
             )
         )
 
@@ -245,11 +294,19 @@ def assess(
         if target not in SAFE_TRIGGERS
     ]
     if unsafe_triggers:
+        # debfed never runs maintainer scripts, so an unrecognised trigger
+        # means one refresh action does not happen -- an icon cache, a
+        # certificate bundle. That is a degradation, not a hazard, and
+        # refusing on it rejects ordinary packages such as ca-certificates
+        # and cups.
         findings.append(
             Finding(
-                Severity.FATAL, "TRIGGERS",
-                "package declares dpkg triggers with no rpm equivalent",
-                ", ".join(unsafe_triggers),
+                Severity.FATAL if strict_scripts else Severity.WARN,
+                "TRIGGERS",
+                f"{len(unsafe_triggers)} dpkg trigger(s) have no rpm equivalent",
+                ", ".join(unsafe_triggers[:6])
+                + "\n    These refresh actions will not run. Re-run the "
+                "equivalent command by hand if the package depends on it.",
             )
         )
 
@@ -257,8 +314,11 @@ def assess(
     for script_name, body in deb.maintainer_scripts.items():
         if not DEBCONF_ANY.search(body):
             continue
-        prompts = DEBCONF_PROMPTING.search(body)
-        templates = sorted(set(DEBCONF_TEMPLATE.findall(body)))
+        prompts = any(
+            DEBCONF_PROMPTING.search(line.split("#", 1)[0])
+            for line in body.splitlines()
+        )
+        templates = debconf_templates(body)
         shown = ", ".join(templates[:4]) if templates else "unnamed"
         if prompts:
             findings.append(
@@ -290,7 +350,7 @@ def assess(
             if re.search(pattern, body):
                 severity = (
                     Severity.WARN
-                    if code in ("USER", "SYSTEMD_UNIT")
+                    if code in ("USER", "SYSTEMD_UNIT", "TRIGGER")
                     else Severity.FATAL
                 )
                 findings.append(

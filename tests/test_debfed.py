@@ -237,13 +237,51 @@ def test_refuses_kernel_path(tmp: Path):
     assert any(f.code == "SYSTEM_PATH" for f in a.fatal)
 
 
-def test_refuses_pre_depends(tmp: Path):
+def test_pre_depends_is_informational_not_a_refusal(tmp: Path):
+    """Pre-Depends states unpack ordering, not a conflict.
+
+    "Pre-Depends: dpkg" is universally true on Debian and meaningless on
+    Fedora. Refusing on its presence rejected Chromium. Being a base
+    package is caught separately by BASE_PACKAGES.
+    """
     deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"x"},
-                   control_extra="Pre-Depends: dpkg (>= 1.19)\n")
+                   control_extra="Pre-Depends: dpkg (>= 1.19), libc6\n")
     d = unpack(deb, tmp / "w")
     a = assess(d, _empty_reloc(tmp), Resolution())
-    assert a.verdict is Verdict.REFUSE
-    assert any(f.code == "PRE_DEPENDS" for f in a.fatal)
+    assert a.verdict is not Verdict.REFUSE
+    assert any(f.code == "PRE_DEPENDS" for f in a.warnings)
+
+
+def test_systemd_unit_path_is_not_a_base_path(tmp: Path):
+    """/usr/lib/systemd/system is %{_unitdir} -- where rpms MUST ship units.
+
+    Treating it as a boot path refused every package shipping a service
+    file, which is correct behaviour for a daemon.
+    """
+    deb = make_deb(tmp, "daemonapp", "1.0-1", {
+        "usr/bin/daemonapp": b"\x7fELF",
+        "usr/lib/systemd/system/daemonapp.service": b"[Unit]\n",
+    })
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    a = assess(d, reloc, Resolution())
+    assert a.verdict is not Verdict.REFUSE
+    assert not any(f.code == "SYSTEM_PATH" for f in a.fatal)
+
+
+def test_shipped_units_get_lifecycle_scriptlets_but_are_not_enabled(tmp: Path):
+    """systemd must be told a unit exists; Fedora presets decide enabling."""
+    deb = make_deb(tmp, "daemonapp", "1.0-1", {
+        "usr/bin/daemonapp": b"\x7fELF",
+        "usr/lib/systemd/system/daemonapp.service": b"[Unit]\n",
+    })
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "A")
+    text = spec.render(plan, reloc.buildroot)
+    assert "systemctl daemon-reload" in text
+    assert "disable --now daemonapp.service" in text
+    assert "systemctl enable" not in text
 
 
 def test_refuses_dpkg_divert(tmp: Path):
@@ -270,11 +308,26 @@ def test_ldconfig_trigger_is_not_a_refusal(tmp: Path):
     assert not any(f.code == "TRIGGERS" for f in a.fatal)
 
 
-def test_unknown_trigger_is_a_refusal(tmp: Path):
+def test_unknown_trigger_warns_but_does_not_refuse(tmp: Path):
+    """An unrecognised trigger costs a refresh action, not safety.
+
+    debfed never runs maintainer scripts, so a trigger it cannot map just
+    means one refresh does not happen. Refusing on it rejected ordinary
+    packages -- ca-certificates and cups among them.
+    """
     deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"x"},
                    triggers="interest-noawait /some/weird/path\n")
     d = unpack(deb, tmp / "w")
     a = assess(d, _empty_reloc(tmp), Resolution())
+    assert a.verdict is not Verdict.REFUSE
+    assert any(f.code == "TRIGGERS" for f in a.warnings)
+
+
+def test_unknown_trigger_refuses_under_strict_scripts(tmp: Path):
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"x"},
+                   triggers="interest-noawait /some/weird/path\n")
+    d = unpack(deb, tmp / "w")
+    a = assess(d, _empty_reloc(tmp), Resolution(), strict_scripts=True)
     assert a.verdict is Verdict.REFUSE
 
 
@@ -997,3 +1050,60 @@ def test_shared_options_work_after_the_subcommand():
 
     before = parser.parse_args(["--strict-scripts", "inspect", "x.deb"])
     assert before.strict_scripts is True
+
+
+def test_directory_ownership_is_an_allowlist(tmp: Path):
+    """Enumerating shared directories is unwinnable.
+
+    A 56-package corpus claimed 155 shared directories -- /usr/share/locale
+    alone has hundreds. A package may own only directories inside its own
+    tree; everything else is left unowned, which rpm handles fine.
+    """
+    payload = tmp / "payload"
+    for d in ("usr/share/locale/fr/LC_MESSAGES", "usr/lib/tmpfiles.d",
+              "usr/lib/systemd/system", "etc/default", "usr/games"):
+        (payload / d).mkdir(parents=True, exist_ok=True)
+        (payload / d / "f").write_bytes(b"x")
+    (payload / "usr/lib/myapp").mkdir(parents=True)
+    # A real ELF header: the detector reads e_machine at offset 18, so a
+    # four-byte stub is correctly not recognised as an object file.
+    (payload / "usr/lib/myapp/libmine.so").write_bytes(_elf(0x3E))
+
+    reloc = layout.relocate(payload, tmp / "br")
+    owned = reloc.ownable_dirs
+    for shared in ("/usr/share/locale", "/usr/share/locale/fr",
+                   "/usr/lib/tmpfiles.d", "/usr/lib/systemd",
+                   "/usr/lib/systemd/system", "/etc/default", "/usr/games"):
+        assert shared not in owned, f"claims shared directory {shared}"
+    assert "/usr/lib/myapp" in owned
+
+
+def test_distribution_dropin_dirs_are_not_private_prefixes(tmp: Path):
+    """/usr/lib/udev holds config, not one application's tree."""
+    payload = tmp / "payload"
+    for d in ("usr/lib/udev/rules.d", "usr/lib/sysusers.d", "usr/lib/mime/packages"):
+        (payload / d).mkdir(parents=True, exist_ok=True)
+        (payload / d / "conf").write_bytes(b"data")
+    reloc = layout.relocate(payload, tmp / "br")
+    assert reloc.private_prefixes == [], reloc.private_prefixes
+
+
+def test_debian_only_trees_are_dropped(tmp: Path):
+    """lintian, bug and apport data have no Fedora counterpart."""
+    payload = tmp / "payload"
+    for f in ("usr/share/lintian/overrides/app", "usr/share/bug/app/control",
+              "usr/share/apport/package-hooks/app.py", "usr/lib/mime/packages/app"):
+        p = payload / f
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+    (payload / "usr/bin").mkdir(parents=True)
+    (payload / "usr/bin/app").write_bytes(b"\x7fELF")
+
+    reloc = layout.relocate(payload, tmp / "br")
+    assert reloc.files == ["/usr/bin/app"], reloc.files
+    # dropped lists directories as well as files
+    for gone in ("/usr/share/lintian/overrides/app",
+                 "/usr/share/bug/app/control",
+                 "/usr/share/apport/package-hooks/app.py",
+                 "/usr/lib/mime/packages/app"):
+        assert gone in reloc.dropped, gone

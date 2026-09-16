@@ -99,7 +99,15 @@ DROP_PATTERNS: tuple[str, ...] = (
     "usr/share/doc/*/README.Debian",
     "usr/share/doc/*/copyright.debian",
     "usr/share/menu/*",
+    # Debian-only infrastructure with no Fedora counterpart. Shipping it
+    # is dead weight and every package claims the same directories.
     "usr/share/lintian/*",
+    "usr/share/bug/*",
+    "usr/share/apport/*",
+    "usr/lib/mime/*",
+    "etc/apt/*",
+    "usr/share/debconf/*",
+    "usr/share/menu/*",
     "DEBIAN/*",
 )
 
@@ -129,8 +137,23 @@ class Relocation:
 
     @property
     def ownable_dirs(self) -> list[str]:
-        """Directories the RPM may safely own."""
-        return [d for d in self.dirs if d not in UNOWNABLE_DIRS]
+        """Directories the RPM may safely own.
+
+        An allowlist, not a blocklist. Enumerating every shared directory
+        is unwinnable -- a 56-package sample claimed 155 of them, and
+        /usr/share/locale alone has hundreds. A package may own only
+        directories inside its own tree; everything else is left unowned,
+        which rpm handles fine.
+        """
+        return [d for d in self.dirs if self.may_own(d)]
+
+    def may_own(self, directory: str) -> bool:
+        if directory in UNOWNABLE_DIRS:
+            return False
+        return any(
+            directory == prefix or directory.startswith(prefix + "/")
+            for prefix in self.private_prefixes
+        )
 
 
 def translate(rel_path: str) -> str:
@@ -243,6 +266,19 @@ def relocate(payload: Path, buildroot: Path) -> Relocation:
 # /usr/share subdirectories that belong to the distribution, never to a
 # single application, so they are not private prefixes no matter what they
 # contain.
+# /usr/lib subdirectories that are distribution infrastructure, shared by
+# every package that drops a file in them -- never one application's tree.
+SHARED_USR_LIB = frozenset({
+    "systemd", "udev", "tmpfiles.d", "sysusers.d", "modules-load.d",
+    "sysctl.d", "binfmt.d", "modprobe.d", "environment.d", "kernel",
+    "firmware", "modules", "dracut", "grub", "mime", "cron", "rpm",
+    "pkgconfig", "locale", "python3", "python3.11", "python3.12",
+    "python3.13", "python3.14", "perl5", "ruby", "node_modules",
+    "gio", "gdk-pixbuf-2.0", "girepository-1.0", "NetworkManager",
+    "security", "sasl2", "cups", "polkit-1", "os-release", "debug",
+    "X11", "ostree", "firewalld", "dbus-1",
+})
+
 SHARED_USR_SHARE = frozenset({
     "applications", "icons", "pixmaps", "man", "doc", "metainfo", "mime",
     "locale", "fonts", "bash-completion", "zsh", "licenses", "dbus-1",
@@ -266,7 +302,13 @@ def _detect_private_prefixes(dirs: list[str], buildroot: Path | None = None) -> 
         parts = d.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "opt":
             prefixes.append(d)
-        elif len(parts) == 3 and parts[:2] in (["usr", "lib"], ["usr", "lib64"]):
+        elif (
+            len(parts) == 3
+            and parts[:2] in (["usr", "lib"], ["usr", "lib64"])
+            and parts[2] not in SHARED_USR_LIB
+            and buildroot is not None
+            and _holds_elf(buildroot / d.lstrip("/"))
+        ):
             prefixes.append(d)
         elif (
             len(parts) == 3
@@ -291,5 +333,23 @@ def _holds_shared_objects(path: Path) -> bool:
         return False
     for child in path.rglob("*.so*"):
         if child.is_file():
+            return True
+    return False
+
+
+def _holds_elf(path: Path) -> bool:
+    """True if this directory tree contains any ELF object.
+
+    A private application prefix holds binaries or libraries of its own.
+    A distribution drop-in directory -- /usr/lib/tmpfiles.d, /usr/lib/udev
+    -- holds configuration, and every package that writes there would
+    otherwise claim to own it.
+    """
+    from .elf import is_elf
+
+    if not path.is_dir():
+        return False
+    for child in path.rglob("*"):
+        if child.is_file() and not child.is_symlink() and is_elf(child):
             return True
     return False

@@ -247,13 +247,44 @@ def render(plan: SpecPlan, payload_dir: Path) -> str:
     add("cp -a %{debfed_payload}/. %{buildroot}/")
     add("")
 
+    # --- systemd units ----------------------------------------------------
+    # /usr/lib/systemd/system is %{_unitdir}: shipping a unit there is the
+    # documented, correct thing for an rpm to do. systemd still has to be
+    # told the unit exists, so emit the lifecycle scriptlets.
+    #
+    # Units are deliberately NOT enabled. Fedora's preset policy governs
+    # what starts by default, and a converted third-party package has no
+    # business opting itself in.
+    units = sorted(
+        f.rsplit("/", 1)[1]
+        for f in reloc.files
+        if (f.startswith("/usr/lib/systemd/system/")
+            or f.startswith("/usr/lib/systemd/user/"))
+        and f.rsplit(".", 1)[-1] in
+            ("service", "socket", "timer", "target", "path", "mount")
+    )
+    if units:
+        add("# Unit files shipped; registered but deliberately not enabled.")
+        add("%post")
+        add("systemctl daemon-reload >/dev/null 2>&1 || :")
+        add("")
+        add("%preun")
+        add("if [ $1 -eq 0 ]; then")
+        for unit in units:
+            add(f"  systemctl --no-reload disable --now {unit} >/dev/null 2>&1 || :")
+        add("fi")
+        add("")
+        add("%postun")
+        add("systemctl daemon-reload >/dev/null 2>&1 || :")
+        add("")
+
     # --- scriptlets ------------------------------------------------------
-    if plan.scripts.post:
+    if plan.scripts.post and not units:
         add("%post")
         for fragment in plan.scripts.post:
             add(fragment)
         add("")
-    if plan.scripts.postun:
+    if plan.scripts.postun and not units:
         add("%postun")
         for fragment in plan.scripts.postun:
             add(fragment)
@@ -263,7 +294,10 @@ def render(plan: SpecPlan, payload_dir: Path) -> str:
     add("%files")
     conffiles = set(deb.conffiles)
 
-    ownable = [d for d in reloc.dirs if d not in UNOWNABLE_DIRS]
+    # Own only directories inside this package's own tree. Anything shared
+    # is left unowned: claiming it is what makes alien output conflict with
+    # filesystem, systemd, glibc-langpack and friends.
+    ownable = reloc.ownable_dirs
     # Own only the topmost of each private tree; rpm takes the rest via %dir
     tops: list[str] = []
     for d in sorted(ownable):

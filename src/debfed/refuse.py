@@ -358,14 +358,31 @@ def assess(
                 )
 
     # ---- dependency verdict ------------------------------------------
-    glibc_gap = res.needs_newer_glibc
-    if glibc_gap:
+    # Version skew is a property of the binaries and the running host, so
+    # it is checked directly rather than inferred from what dnf could not
+    # satisfy. Otherwise --offline silently accepts packages that can
+    # never run: audacity requiring GLIBC_2.43 on a 2.39 host built fine
+    # and then failed at exec.
+    skew = res.glibc_skew
+    if skew:
+        required, host = skew
+        req_s = ".".join(str(x) for x in required)
+        host_s = ".".join(str(x) for x in host)
+        findings.append(
+            Finding(
+                Severity.FATAL, "GLIBC_SKEW",
+                f"payload needs glibc {req_s}; this host has {host_s}",
+                "Forward compatibility does not work in this direction. "
+                "Bundling glibc would require shipping a matching ld.so, "
+                "which is out of scope. Use a newer Fedora, or a container.",
+            )
+        )
+    elif res.needs_newer_glibc:
         findings.append(
             Finding(
                 Severity.FATAL, "GLIBC_SKEW",
                 "payload needs a newer glibc than this host provides",
-                f"{glibc_gap} is unsatisfiable. Bundling glibc would require "
-                "shipping a matching ld.so; that is out of scope.",
+                f"{res.needs_newer_glibc} is unsatisfiable.",
             )
         )
 
@@ -378,6 +395,22 @@ def assess(
                 ", ".join(toolkit_gap[:6])
                 + "\n    Prefixing LD_LIBRARY_PATH breaks as soon as the app "
                 "dlopens a host module (mesa, GTK modules, NSS).",
+            )
+        )
+
+    symver = res.symbol_version_only
+    if symver:
+        findings.append(
+            Finding(
+                Severity.WARN, "SYMBOL_VERSION",
+                f"{len(symver)} capability/capabilities differ only by symbol version",
+                ", ".join(symver[:4])
+                + "\n    The library itself resolves; only a distribution-specific "
+                "symbol label is absent. Debian adds its own symbol versions to "
+                "some libraries whose ABI is unchanged -- libcurl is the known "
+                "case, where upstream exports unversioned symbols and Debian "
+                "added CURL_OPENSSL_4. Bundling fixes it; the application would "
+                "very likely have run without.",
             )
         )
 

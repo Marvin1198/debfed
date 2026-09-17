@@ -280,7 +280,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             python3 python3-pip python3-pyyaml python3-pytest \
-            rpm-build zstd findutils tar jq
+            rpm-build patchelf zstd findutils tar jq
 
       - name: Install debfed
         run: python3 -m pip install -e .
@@ -474,13 +474,70 @@ jobs:
           echo "Refusal engine: libc6 correctly refused." >> "$GITHUB_STEP_SUMMARY"
 
   # ------------------------------------------------------------------
+  # 8b. Corpus. Every serious bug in this project was found by running a
+  #     diverse sample and looking at the distribution of outcomes, not by
+  #     testing one application. Foreign-architecture binaries, the
+  #     inverted glibc check and directory ownership were all invisible
+  #     from a single package.
+  # ------------------------------------------------------------------
+  corpus:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            python3 python3-pip python3-pyyaml rpm-build patchelf \
+            zstd findutils curl jq
+
+      - name: Install debfed
+        run: python3 -m pip install -e .
+
+      - name: Fetch corpus
+        run: python3 tests/corpus.py fetch
+
+      - name: Measure verdicts
+        run: python3 tests/corpus.py measure | tee corpus.log
+
+      - name: Install and execute every converted package
+        run: python3 tests/corpus.py run | tee runtest.log
+
+      - name: Gate on crashes and build failures
+        run: |
+          # A crash is always a bug. Refusals are not.
+          if grep -qE '^  (CRASH|ERROR|build failed)' corpus.log runtest.log; then
+            echo "::error title=corpus::debfed crashed or failed to build a package"
+            exit 1
+          fi
+          echo "no crashes across the corpus"
+
+      - name: Publish corpus results to job summary
+        if: always()
+        run: |
+          {
+            echo "### Corpus"
+            echo '```'
+            cat corpus.log
+            echo '```'
+            echo "### Execution"
+            echo '```'
+            cat runtest.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
   # 9. Single required status. Use this one job in branch protection, so
   #    adding a gate above never means editing repository settings.
   # ------------------------------------------------------------------
   gate:
     name: all checks passed
     runs-on: ubuntu-latest
-    needs: [ lint, sast, codeql, dependency-audit, secrets, test, exploit-suite, package-integrity ]
+    needs: [ lint, sast, codeql, dependency-audit, secrets, test, exploit-suite, package-integrity, corpus ]
     if: always()
     steps:
       - name: Verify every gate succeeded

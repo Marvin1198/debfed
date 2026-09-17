@@ -214,6 +214,31 @@ def _repoquery(cap: str) -> list[str]:
     return []
 
 
+def max_required_glibc(requires: list[str]) -> tuple[int, ...] | None:
+    """Highest GLIBC_ symbol version the payload demands, for THIS arch.
+
+    Derived from the payload alone -- no repository access. Version skew
+    is a property of the binaries and the running host, so making the
+    check depend on dnf meant --offline silently accepted packages that
+    could never run. Only 64-bit x86 requirements count; other
+    architectures have their own, lower, symbol namespaces.
+    """
+    worst: tuple[int, ...] | None = None
+    for cap in requires:
+        if not cap.startswith(("libc.so.6", "libm.so.6", "libpthread.so.0",
+                               "libdl.so.2", "librt.so.1")):
+            continue
+        if "(64bit)" not in cap:
+            continue
+        m = GLIBC_RE.search(cap)
+        if not m:
+            continue
+        ver = tuple(int(x) for x in m.groups() if x is not None)
+        if worst is None or ver > worst:
+            worst = ver
+    return worst
+
+
 @dataclass
 class Resolution:
     requires: list[str] = field(default_factory=list)
@@ -235,8 +260,50 @@ class Resolution:
         return sorted(out)
 
     @property
+    def symbol_version_only(self) -> list[str]:
+        """Capabilities missing ONLY a symbol version, not the library.
+
+        Some distributions add their own symbol versions to a library
+        whose ABI is otherwise unchanged. Debian's libcurl is the
+        canonical case: upstream curl exports unversioned symbols, and
+        Debian added CURL_OPENSSL_3/4 during its libcurl3->4 transition.
+        Fedora ships the upstream style, so a Debian binary asks for
+        CURL_OPENSSL_4 from a library that is fully ABI-compatible but
+        does not carry that label.
+
+        These are reported separately because they are a naming artifact
+        rather than a real incompatibility -- bundling resolves them, but
+        the application would very likely have run either way.
+        """
+        satisfied_sonames = {
+            cap.split("(", 1)[0] for cap in self.satisfied if ".so" in cap
+        }
+        out = []
+        for cap in self.unsatisfied:
+            base = cap.split("(", 1)[0]
+            if ".so" not in base:
+                continue
+            # the bare soname resolves; only the versioned form does not
+            if base in satisfied_sonames or f"{base}()(64bit)" in self.satisfied:
+                out.append(cap)
+        return out
+
+    @property
     def missing_sonames(self) -> list[str]:
         return [c for c in self.unsatisfied if ".so" in c]
+
+    @property
+    def glibc_skew(self) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+        """(required, host) when the payload needs a newer glibc, else None.
+
+        Independent of dnf: a binary requiring GLIBC_2.43 cannot run on a
+        host with 2.39 regardless of what any repository contains.
+        """
+        host = host_glibc_version()
+        required = max_required_glibc(self.requires)
+        if host is None or required is None or required <= host:
+            return None
+        return required, host
 
     @property
     def needs_newer_glibc(self) -> str | None:

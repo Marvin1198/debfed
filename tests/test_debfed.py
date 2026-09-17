@@ -1107,3 +1107,106 @@ def test_debian_only_trees_are_dropped(tmp: Path):
                  "/usr/share/apport/package-hooks/app.py",
                  "/usr/lib/mime/packages/app"):
         assert gone in reloc.dropped, gone
+
+
+# =====================================================================
+# Strategy B: bundling a library the host cannot provide.
+#
+# The original design used an LD_LIBRARY_PATH wrapper. That variable is
+# inherited across the whole execve tree, so an application spawning
+# xdg-open or a browser forces its bundled libraries onto them. Debian's
+# own wiki discourages it for exactly this reason. The path is baked into
+# the binary instead.
+# =====================================================================
+
+
+def test_bundle_uses_rpath_not_runpath():
+    """RUNPATH resolves only the object carrying it, not that object's
+    own dependencies. Bundled libraries have dependencies, so RUNPATH
+    resolves the first level and fails on the second."""
+    import inspect as _inspect
+
+    from debfed import bundle
+
+    source = _inspect.getsource(bundle.apply_bundle)
+    assert "--force-rpath" in source, "patchelf writes RUNPATH without this"
+
+
+def test_bundle_paths_are_relocatable():
+    import inspect as _inspect
+
+    from debfed import bundle
+
+    assert "$ORIGIN" in _inspect.getsource(bundle.apply_bundle)
+
+
+def test_bundle_refuses_non_library_capabilities(tmp: Path):
+    """A private prefix cannot supply a file path or an interpreter."""
+    from debfed.bundle import plan_bundle
+
+    (tmp / "br").mkdir()
+    plan = plan_bundle("app", ["/usr/bin/python3", "some-package"], tmp / "br")
+    assert plan.unresolved == ["/usr/bin/python3", "some-package"]
+    assert not plan.viable
+
+
+def test_bundle_reports_unfindable_library(tmp: Path):
+    from debfed.bundle import plan_bundle
+
+    (tmp / "br").mkdir()
+    plan = plan_bundle("app", ["libnowhere.so.3()(64bit)"], tmp / "br")
+    assert plan.unresolved == ["libnowhere.so.3()(64bit)"]
+
+
+def test_soname_extraction():
+    from debfed.bundle import soname_of
+
+    assert soname_of("libcurl.so.4(CURL_OPENSSL_4)(64bit)") == "libcurl.so.4"
+    assert soname_of("libfoo.so.1()(64bit)") == "libfoo.so.1"
+    assert soname_of("/usr/bin/bash") is None
+    assert soname_of("rtld(GNU_HASH)") is None
+
+
+# =====================================================================
+# glibc skew must be decidable without repository access.
+# =====================================================================
+
+
+def test_glibc_skew_is_detected_without_dnf():
+    """A binary requiring GLIBC_2.43 cannot run on a 2.39 host whatever
+    any repository contains. Deriving this from the unsatisfied list
+    meant --offline silently accepted packages that could never start."""
+    from debfed.depsolve import max_required_glibc
+
+    reqs = [
+        "libc.so.6(GLIBC_2.38)(64bit)",
+        "libm.so.6(GLIBC_2.43)(64bit)",
+        "libc.so.6(GLIBC_2.17)(64bit)",
+    ]
+    assert max_required_glibc(reqs) == (2, 43)
+
+
+def test_glibc_from_other_architectures_is_ignored():
+    """32-bit and foreign-arch symbols have their own lower namespaces."""
+    from debfed.depsolve import max_required_glibc
+
+    assert max_required_glibc(["libc.so.6(GLIBC_2.4)"]) is None
+    assert max_required_glibc([]) is None
+
+
+# =====================================================================
+# Symbol-version-only misses are a naming artifact, not a broken ABI.
+# =====================================================================
+
+
+def test_symbol_version_only_is_classified_separately():
+    """Debian added CURL_OPENSSL_3/4 to libcurl during its libcurl3->4
+    transition; upstream curl exports unversioned symbols and Fedora
+    ships the upstream style. The ABI is identical."""
+    res = Resolution(
+        satisfied={"libcurl.so.4()(64bit)": ["libcurl"],
+                   "libgtk-3.so.0()(64bit)": ["gtk3"]},
+        unsatisfied=["libcurl.so.4(CURL_OPENSSL_4)(64bit)",
+                     "libgone.so.9()(64bit)"],
+    )
+    assert res.symbol_version_only == ["libcurl.so.4(CURL_OPENSSL_4)(64bit)"]

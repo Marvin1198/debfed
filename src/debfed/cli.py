@@ -33,6 +33,7 @@ from .build import (
     find_conflicts,
     rpm_query_installed,
 )
+from .bundle import BundleError, apply_bundle, plan_bundle, verify_bundle
 from .deb import Deb, DebError, unpack
 from .depsolve import Resolution, ResolveError, resolve
 from .layout import Relocation, relocate
@@ -117,6 +118,10 @@ def print_inspect(an: Analysis, verbose: bool = False) -> None:
 
     for cap in res.unsatisfied:
         w(f"    {_c('MISSING', RED)}  {cap}\n")
+
+    if res.symbol_version_only:
+        w(f"  {_c('symbol-version', DIM)} {len(res.symbol_version_only)} "
+          f"{_c('differ only by a distribution symbol label', DIM)}\n")
 
     if res.self_satisfied:
         w(f"  {_c('self-provided', DIM)} {len(res.self_satisfied)} capabilities "
@@ -264,8 +269,42 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return worst
 
 
+def _bundle_for_strategy_b(an: Analysis) -> list[str]:
+    """Copy unsatisfiable libraries into the private prefix and re-point
+    the payload at them. Returns the files added, or raises if the
+    bundle cannot be made to resolve."""
+    plan = plan_bundle(an.deb.name, an.res.unsatisfied, an.reloc.buildroot,
+                       extra_sources=[an.deb.payload_dir])
+    if plan.unresolved:
+        raise BundleError(
+            "cannot bundle: no source for "
+            + ", ".join(plan.unresolved[:4])
+            + "\n  These are not libraries present in the package, so a "
+            "private prefix cannot supply them."
+        )
+    added = apply_bundle(plan, an.reloc.buildroot)
+    remaining = verify_bundle(plan, an.reloc.buildroot)
+    if remaining:
+        raise BundleError(
+            "bundle did not resolve: " + ", ".join(remaining[:4])
+            + "\n  Refusing rather than shipping a package that cannot start."
+        )
+    an.reloc.files.extend(added)
+    an.reloc.files.sort()
+    prefix = plan.prefix
+    for d in (prefix, plan.libdir):
+        if d not in an.reloc.dirs:
+            an.reloc.dirs.append(d)
+    an.reloc.dirs.sort()
+    if prefix not in an.reloc.private_prefixes:
+        an.reloc.private_prefixes.append(prefix)
+    return added
+
+
 def _build(an: Analysis, workdir: Path, quiet: bool):
     strategy = "A" if an.assessment.verdict is Verdict.STRATEGY_A else "B"
+    if strategy == "B":
+        _bundle_for_strategy_b(an)
     plan = plan_spec(an.deb, an.reloc, an.scripts, strategy, an.extra_requires)
     spec_text = render(plan, an.reloc.buildroot)
     result = build_rpm(spec_text, an.reloc.buildroot, plan.name, workdir,
@@ -309,6 +348,9 @@ def cmd_build(args: argparse.Namespace) -> int:
             result = build_rpm(spec_text, an.reloc.buildroot, plan.name, tmp,
                                quiet=not args.verbose)
         except UnsafeInput as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except BundleError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         except BuildError as exc:
@@ -362,6 +404,9 @@ def cmd_install(args: argparse.Namespace) -> int:
         try:
             _, _, result = _build(an, tmp, quiet=not args.verbose)
         except UnsafeInput as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except BundleError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         except BuildError as exc:

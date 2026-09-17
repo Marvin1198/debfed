@@ -1,5 +1,5 @@
 %global pypi_name debfed
-%global forgeurl https://github.com/Marvin1198/debfed
+%global forgeurl https://github.com/USER/debfed
 
 Name:           debfed
 Version:        0.1.0
@@ -20,6 +20,8 @@ BuildRequires:  python3-pytest
 Requires:       rpm-build
 Requires:       python3-pyyaml
 Requires:       dnf
+# Strategy B rewrites RPATH on bundled binaries.
+Requires:       patchelf
 # Needed only on Python < 3.14, where tarfile cannot read zstd payloads.
 Recommends:     zstd
 

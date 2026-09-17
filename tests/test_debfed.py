@@ -1210,3 +1210,67 @@ def test_symbol_version_only_is_classified_separately():
                      "libgone.so.9()(64bit)"],
     )
     assert res.symbol_version_only == ["libcurl.so.4(CURL_OPENSSL_4)(64bit)"]
+
+
+def test_corpus_harness_refuses_when_debfed_cannot_run():
+    """A harness that cannot invoke debfed must not report results.
+
+    corpus.py counted exit 1 as "refused", so a failed invocation produced
+    "refused 54 100%" -- a plausible-looking distribution from a run in
+    which nothing executed. This is the same fail-open the exploit suite
+    had; both now share tests/_cli.py so the fix cannot apply to one and
+    not the other.
+    """
+    from unittest import mock
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import corpus
+
+    corpus._INVOCATION[:] = ["debfed"]
+
+    # exit 2 means debfed could not reach a verdict, never "refused"
+    failed = subprocess.CompletedProcess([], returncode=2, stdout="",
+                                         stderr="error: dnf not found")
+    with mock.patch("corpus.subprocess.run", return_value=failed):
+        with pytest.raises(corpus.CliUnavailable):
+            corpus._debfed("inspect", "x.deb")
+
+    # so does an import failure, whatever the exit code
+    broken = subprocess.CompletedProcess([], returncode=1, stdout="",
+                                         stderr="No module named debfed")
+    with mock.patch("corpus.subprocess.run", return_value=broken):
+        with pytest.raises(corpus.CliUnavailable):
+            corpus._debfed("inspect", "x.deb")
+
+    # a real verdict is passed through untouched
+    refused = subprocess.CompletedProcess([], returncode=1, stdout="[]",
+                                          stderr="error: base package")
+    with mock.patch("corpus.subprocess.run", return_value=refused):
+        assert corpus._debfed("inspect", "x.deb").returncode == 1
+
+
+def test_corpus_harness_refuses_an_empty_corpus(tmp: Path):
+    """Measuring nothing is not a passing measurement."""
+    import shutil as _shutil
+
+    work = tmp / "harness"
+    _shutil.copytree(Path(__file__).parent, work,
+                     ignore=_shutil.ignore_patterns("__pycache__", "debs",
+                                                    "rpms", "root"))
+    proc = subprocess.run([sys.executable, str(work / "corpus.py"), "measure"],
+                          capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 2
+    assert "no packages" in proc.stdout + proc.stderr
+
+
+def test_both_harnesses_share_one_invocation_resolver():
+    """The pipx bug was fixed in the exploit suite and not the corpus
+    harness. Sharing the resolver is what stops that recurring."""
+    import inspect as _inspect
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import attack_suite
+    import corpus
+
+    assert "_cli" in _inspect.getsource(corpus)
+    assert "_cli" in _inspect.getsource(attack_suite)

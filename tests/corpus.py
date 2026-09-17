@@ -31,6 +31,9 @@ import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _cli import CliUnavailable, ran_successfully, resolve_invocation  # noqa: E402
+
 BASE = "http://archive.ubuntu.com/ubuntu/pool"
 HERE = pathlib.Path(__file__).resolve().parent
 DEBS = HERE / "debs"
@@ -80,14 +83,35 @@ def cmd_fetch(_args) -> int:
     return 0
 
 
+_INVOCATION: list[str] = []
+
+
 def _debfed(*args: str, timeout: int = 600) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, "-m", "debfed", *args],
-                          capture_output=True, text=True, timeout=timeout)
+    """Run debfed, refusing to continue if it did not actually execute.
+
+    A harness that cannot invoke debfed reports every package as refused.
+    That looks like a result and is not, so a failed invocation aborts
+    the whole run rather than being counted.
+    """
+    proc = subprocess.run([*_INVOCATION, *args], capture_output=True,
+                          text=True, timeout=timeout)
+    if not ran_successfully(proc.returncode, proc.stdout + proc.stderr):
+        tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-6:])
+        raise CliUnavailable(
+            f"debfed exited {proc.returncode} without reaching a verdict "
+            f"for: {' '.join(args)}\n{tail}"
+        )
+    return proc
 
 
 def cmd_measure(args) -> int:
+    debs = sorted(DEBS.glob("*.deb"))
+    if not debs:
+        print(f"no packages in {DEBS}. Run:  python3 tests/corpus.py fetch",
+              file=sys.stderr)
+        return 2
     rows = []
-    for deb in sorted(DEBS.glob("*.deb")):
+    for deb in debs:
         flags = ["inspect", "--json"]
         if args.offline:
             flags.append("--offline")
@@ -128,11 +152,16 @@ def cmd_run(_args) -> int:
     if shutil.which("rpm") is None:
         print("rpm not found", file=sys.stderr)
         return 2
+    debs = sorted(DEBS.glob("*.deb"))
+    if not debs:
+        print(f"no packages in {DEBS}. Run:  python3 tests/corpus.py fetch",
+              file=sys.stderr)
+        return 2
     RPMS.mkdir(parents=True, exist_ok=True)
     results = collections.Counter()
     detail = collections.defaultdict(list)
 
-    for deb in sorted(DEBS.glob("*.deb")):
+    for deb in debs:
         build = _debfed("build", "-o", str(RPMS), str(deb))
         if build.returncode == 1:
             results["refused"] += 1
@@ -202,7 +231,17 @@ def main() -> int:
     m.set_defaults(func=cmd_measure)
     sub.add_parser("run").set_defaults(func=cmd_run)
     args = ap.parse_args()
-    return args.func(args)
+    if args.cmd in ("measure", "run"):
+        try:
+            _INVOCATION[:] = resolve_invocation()
+        except CliUnavailable as exc:
+            print(f"\nHARNESS UNUSABLE\n{exc}\n", file=sys.stderr)
+            return 2
+    try:
+        return args.func(args)
+    except CliUnavailable as exc:
+        print(f"\nHARNESS UNUSABLE\n{exc}\n", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

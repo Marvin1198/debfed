@@ -99,6 +99,11 @@ DID_NOT_RUN = (
 VERDICT_CODES = (0, 1)
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _cli import CliUnavailable as _CliUnavailable  # noqa: E402
+from _cli import resolve_invocation as _resolve  # noqa: E402
+
+
 class SuiteUnusable(Exception):
     """debfed could not be invoked; results would be meaningless."""
 
@@ -167,6 +172,14 @@ class Suite:
 
 
 def resolve_invocation() -> list[str]:
+    """Delegates to the shared helper so the two harnesses cannot diverge."""
+    try:
+        return _resolve()
+    except _CliUnavailable as exc:
+        raise SuiteUnusable(str(exc)) from exc
+
+
+def _resolve_invocation_unused() -> list[str]:
     """Find a working way to run debfed, or refuse to proceed.
 
     pipx installs into its own venv, so `python3 -m debfed` fails even

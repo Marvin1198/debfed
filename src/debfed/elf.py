@@ -106,3 +106,75 @@ def partition_by_arch(
         else:
             foreign.setdefault(machine_name(machine), []).append(path)
     return ours, foreign
+
+
+# ---------------------------------------------------------------- versions
+
+SHT_GNU_VERDEF = 0x6FFFFFFD
+
+
+def _section_headers(fh, header: bytes):
+    """Yield (sh_type, sh_offset, sh_size, sh_link, name_off) for ELF64."""
+    if header[4] != 2:                      # EI_CLASS: 64-bit only
+        return
+    endian = "<" if header[5] == 1 else ">"
+    e_shoff = struct.unpack(endian + "Q", header[0x28:0x30])[0]
+    e_shentsize = struct.unpack(endian + "H", header[0x3A:0x3C])[0]
+    e_shnum = struct.unpack(endian + "H", header[0x3C:0x3E])[0]
+    if not e_shoff or not e_shnum or e_shentsize < 64:
+        return
+    fh.seek(e_shoff)
+    raw = fh.read(e_shentsize * e_shnum)
+    for i in range(e_shnum):
+        ent = raw[i * e_shentsize : i * e_shentsize + 64]
+        if len(ent) < 64:
+            break
+        name_off, sh_type = struct.unpack(endian + "II", ent[0:8])
+        sh_offset, sh_size = struct.unpack(endian + "QQ", ent[0x18:0x28])
+        sh_link = struct.unpack(endian + "I", ent[0x28:0x2C])[0]
+        yield sh_type, sh_offset, sh_size, sh_link, name_off
+
+
+def has_version_definitions(path: Path) -> bool | None:
+    """Does this library define symbol versions at all?
+
+    This decides whether a missing symbol version is fatal. glibc's
+    dl-version.c returns success with only a "no version information
+    available" warning when the provider has no DT_VERDEF at all -- the
+    dependent object was simply linked against a differently-versioned
+    build. If the provider DOES define versions but not the required
+    one, the load fails.
+
+    So a Debian binary asking for CURL_OPENSSL_4 from Fedora's
+    unversioned libcurl runs; asking for a missing GLIBC_ version from
+    glibc, which is heavily versioned, does not.
+
+    Returns None if the file cannot be read as ELF.
+    """
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(64)
+            if len(header) < 64 or header[:4] != ELF_MAGIC:
+                return None
+            for sh_type, *_ in _section_headers(fh, header):
+                if sh_type == SHT_GNU_VERDEF:
+                    return True
+        return False
+    except OSError:
+        return None
+
+
+DEFAULT_LIBRARY_PATHS = (
+    "/usr/lib64", "/lib64", "/usr/lib", "/lib",
+    "/usr/lib/x86_64-linux-gnu",
+)
+
+
+def find_system_library(soname: str,
+                        search: tuple[str, ...] = DEFAULT_LIBRARY_PATHS) -> Path | None:
+    """Locate a library the host provides, by soname."""
+    for directory in search:
+        candidate = Path(directory) / soname
+        if candidate.exists():
+            return candidate.resolve()
+    return None

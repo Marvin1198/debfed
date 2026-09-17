@@ -1274,3 +1274,87 @@ def test_both_harnesses_share_one_invocation_resolver():
 
     assert "_cli" in _inspect.getsource(corpus)
     assert "_cli" in _inspect.getsource(attack_suite)
+
+
+# =====================================================================
+# A missing symbol version is not always fatal.
+#
+# glibc's dl-version.c returns success with only a "no version
+# information available" warning when the provider defines no symbol
+# versions at all. It fails only when the provider HAS a version table
+# that lacks the required entry. Treating every version miss as fatal
+# sends packages to a private prefix to satisfy a label the dynamic
+# linker does not enforce.
+# =====================================================================
+
+
+def test_version_definitions_are_detected(tmp: Path):
+    from debfed.elf import find_system_library, has_version_definitions
+
+    libc = find_system_library("libc.so.6")
+    assert libc is not None, "no libc on this host?"
+    # glibc is heavily versioned on every GNU system
+    assert has_version_definitions(libc) is True
+
+    (tmp / "notelf").write_bytes(b"#!/bin/sh\n")
+    assert has_version_definitions(tmp / "notelf") is None
+
+
+def test_cosmetic_version_miss_does_not_force_bundling(monkeypatch):
+    """The provider defines no versions: the linker warns and continues."""
+    import debfed.depsolve as d
+
+    monkeypatch.setattr(d, "find_system_library", lambda s: Path("/fake/lib.so"))
+    monkeypatch.setattr(d, "has_version_definitions", lambda p: False)
+
+    res = Resolution(
+        satisfied={"libfoo.so.1()(64bit)": ["foo"]},
+        unsatisfied=["libfoo.so.1(DISTRO_2)(64bit)"],
+    )
+    assert res.cosmetic_version_misses == ["libfoo.so.1(DISTRO_2)(64bit)"]
+    assert res.blocking_unsatisfied == []
+
+
+def test_real_version_miss_still_blocks(monkeypatch):
+    """The provider HAS a version table lacking the entry: the load fails."""
+    import debfed.depsolve as d
+
+    monkeypatch.setattr(d, "find_system_library", lambda s: Path("/fake/lib.so"))
+    monkeypatch.setattr(d, "has_version_definitions", lambda p: True)
+
+    res = Resolution(
+        satisfied={"libfoo.so.1()(64bit)": ["foo"]},
+        unsatisfied=["libfoo.so.1(DISTRO_2)(64bit)"],
+    )
+    assert res.cosmetic_version_misses == []
+    assert res.blocking_unsatisfied == ["libfoo.so.1(DISTRO_2)(64bit)"]
+
+
+def test_unknown_provider_is_treated_as_blocking(monkeypatch):
+    """If the library cannot be found, assume the miss is real."""
+    import debfed.depsolve as d
+
+    monkeypatch.setattr(d, "find_system_library", lambda s: None)
+    res = Resolution(
+        satisfied={"libfoo.so.1()(64bit)": ["foo"]},
+        unsatisfied=["libfoo.so.1(DISTRO_2)(64bit)"],
+    )
+    assert res.blocking_unsatisfied == ["libfoo.so.1(DISTRO_2)(64bit)"]
+
+
+def test_cosmetic_misses_yield_strategy_a(tmp: Path, monkeypatch):
+    import debfed.depsolve as d
+
+    monkeypatch.setattr(d, "find_system_library", lambda s: Path("/fake/lib.so"))
+    monkeypatch.setattr(d, "has_version_definitions", lambda p: False)
+
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"\x7fELF"})
+    dd = unpack(deb, tmp / "w")
+    res = Resolution(
+        requires=["libfoo.so.1()(64bit)", "libfoo.so.1(DISTRO_2)(64bit)"],
+        satisfied={"libfoo.so.1()(64bit)": ["foo"]},
+        unsatisfied=["libfoo.so.1(DISTRO_2)(64bit)"],
+    )
+    a = assess(dd, _empty_reloc(tmp), res)
+    assert a.verdict is Verdict.STRATEGY_A, a.reason
+    assert "symbol-version" in a.reason

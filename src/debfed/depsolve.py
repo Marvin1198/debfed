@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-from .elf import partition_by_arch
+from .elf import find_system_library, has_version_definitions, partition_by_arch
 
 RPMDEPS_CANDIDATES = (
     "/usr/lib/rpm/rpmdeps",
@@ -287,6 +287,41 @@ class Resolution:
             if base in satisfied_sonames or f"{base}()(64bit)" in self.satisfied:
                 out.append(cap)
         return out
+
+    def _classify_version_miss(self, cap: str) -> str:
+        """'cosmetic' | 'real' | 'unknown' for a symbol-version-only miss.
+
+        glibc's dl-version.c: when the provider defines no symbol
+        versions at all, a missing version is graceful degradation --
+        a "no version information available" warning, and the program
+        runs. When the provider DOES define versions but not the
+        required one, the load fails.
+        """
+        soname = cap.split("(", 1)[0]
+        lib = find_system_library(soname)
+        if lib is None:
+            return "unknown"
+        versioned = has_version_definitions(lib)
+        if versioned is None:
+            return "unknown"
+        return "real" if versioned else "cosmetic"
+
+    @property
+    def cosmetic_version_misses(self) -> list[str]:
+        """Version misses the dynamic linker will only warn about.
+
+        These do not need bundling. Sending them to a private prefix
+        drags a distribution's whole dependency chain along to satisfy a
+        label the linker does not enforce.
+        """
+        return [c for c in self.symbol_version_only
+                if self._classify_version_miss(c) == "cosmetic"]
+
+    @property
+    def blocking_unsatisfied(self) -> list[str]:
+        """Unsatisfied capabilities that genuinely prevent the app running."""
+        cosmetic = set(self.cosmetic_version_misses)
+        return [c for c in self.unsatisfied if c not in cosmetic]
 
     @property
     def missing_sonames(self) -> list[str]:

@@ -399,12 +399,18 @@ def assess(
         )
 
     symver = res.symbol_version_only
+    cosmetic_symver = set(res.cosmetic_version_misses)
     if symver:
         findings.append(
             Finding(
                 Severity.WARN, "SYMBOL_VERSION",
                 f"{len(symver)} capability/capabilities differ only by symbol version",
                 ", ".join(symver[:4])
+                + (f"\n    {len(cosmetic_symver)} of these are cosmetic: the "
+                   "provider defines no symbol versions at all, so the dynamic "
+                   "linker warns and continues (glibc dl-version.c). No "
+                   "bundling needed."
+                   if cosmetic_symver else "")
                 + "\n    The library itself resolves; only a distribution-specific "
                 "symbol label is absent. Debian adds its own symbol versions to "
                 "some libraries whose ABI is unchanged -- libcurl is the known "
@@ -465,24 +471,28 @@ def assess(
             Verdict.STRATEGY_A, findings, "no ELF payload; pure data package"
         )
 
-    if not res.unsatisfied:
-        return Assessment(
-            Verdict.STRATEGY_A, findings,
-            f"all {len(res.requires)} requirements resolve against Fedora",
-        )
+    blocking = res.blocking_unsatisfied
+    cosmetic = res.cosmetic_version_misses
+
+    if not blocking:
+        reason = f"all {len(res.requires)} requirements resolve against Fedora"
+        if cosmetic:
+            reason += (f" ({len(cosmetic)} symbol-version label(s) absent; the "
+                       "linker only warns)")
+        return Assessment(Verdict.STRATEGY_A, findings, reason)
 
     if not allow_private_prefix:
         findings.append(
             Finding(
                 Severity.FATAL, "UNSATISFIED",
-                f"{len(res.unsatisfied)} requirements unsatisfied and "
+                f"{len(blocking)} requirements unsatisfied and "
                 "private-prefix fallback is disabled",
-                ", ".join(res.unsatisfied[:6]),
+                ", ".join(blocking[:6]),
             )
         )
         return Assessment(Verdict.REFUSE, findings, "unsatisfied dependencies")
 
     return Assessment(
         Verdict.STRATEGY_B, findings,
-        f"{len(res.unsatisfied)} leaf library/libraries must be bundled",
+        f"{len(blocking)} leaf library/libraries must be bundled",
     )

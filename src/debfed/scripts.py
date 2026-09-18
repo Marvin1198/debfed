@@ -76,6 +76,64 @@ class ScriptPlan:
             self.postun.append(fragment)
 
 
+# Many vendor packages do not ship their PATH entry. They create it in
+# postinst with `ln -s` or update-alternatives, because on Debian the
+# maintainer script is the normal place to do it. debfed never runs those
+# scripts, so without translating them the application installs correctly
+# and is then not on PATH -- which looks like a broken conversion.
+#
+# rpm's equivalent is simply to ship the symlink in %files, where it is
+# owned and removed with the package.
+_LN_RE = re.compile(
+    r"^\s*ln\s+(?:-[a-zA-Z]+\s+)*(?P<target>/[^\s;|&]+)\s+(?P<link>/[^\s;|&]+)",
+    re.MULTILINE,
+)
+_ALTERNATIVES_RE = re.compile(
+    r"update-alternatives\s+--install\s+(?P<link>/[^\s]+)\s+\S+\s+"
+    r"(?P<target>/[^\s]+)",
+    re.MULTILINE,
+)
+
+# Where a package may legitimately place a launcher.
+LAUNCHER_DIRS = ("/usr/bin/", "/usr/sbin/", "/usr/libexec/")
+
+
+def extract_symlinks(scripts: dict[str, str],
+                     package: str = "") -> list[tuple[str, str]]:
+    """Symlinks a maintainer script would have created, as (link, target).
+
+    Only an application's *own* launcher is restored. A generic
+    alternatives slot such as /usr/bin/editor -> /usr/bin/codium is
+    deliberately skipped: that is a shared name arbitrated by
+    update-alternatives on Debian, and claiming ownership of it in an
+    rpm would collide with whatever else provides it.
+
+    The test is that the link and its target share a basename, or the
+    link is named after the package. Everything else is left alone --
+    this restores a PATH entry, it does not replay arbitrary filesystem
+    operations from an untrusted script.
+    """
+    found: dict[str, str] = {}
+    for name, body in scripts.items():
+        if name not in ("postinst", "preinst"):
+            continue
+        code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
+        for match in list(_LN_RE.finditer(code)) + list(
+                _ALTERNATIVES_RE.finditer(code)):
+            link = match.group("link")
+            target = match.group("target")
+            if not link.startswith(LAUNCHER_DIRS):
+                continue
+            if ".." in link or ".." in target:
+                continue
+            link_name = link.rsplit("/", 1)[1]
+            target_name = target.rsplit("/", 1)[1]
+            if link_name != target_name and link_name != package:
+                continue          # a shared alternatives slot, not our launcher
+            found.setdefault(link, target)
+    return sorted(found.items())
+
+
 _NOISE = re.compile(
     r"^\s*(#|set\s|if\s|fi\b|then\b|else\b|elif\s|case\s|esac\b|;;|\}|\{"
     r"|for\s|done\b|do\b|while\s|exit\b|return\b|true\b|:\s*$|\[|\]|\)\s*$)"

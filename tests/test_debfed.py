@@ -1538,3 +1538,89 @@ def test_plan_spec_without_resolution_emits_no_exclusions(tmp: Path):
     plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "A")
     text = spec.render(plan, reloc.buildroot)
     assert "__requires_exclude_from" not in text
+
+
+# =====================================================================
+# Launchers created by maintainer scripts.
+#
+# Many vendor packages ship the application under /usr/share or /opt and
+# create the /usr/bin entry in postinst, because on Debian that is the
+# normal place to do it. debfed never runs those scripts, so without
+# translating them the package installs correctly and is then not on
+# PATH. rpm's equivalent is to ship the symlink in %files.
+# =====================================================================
+
+VSCODIUM_LAUNCHER_POSTINST = """#!/bin/bash
+rm -f /usr/bin/codium
+ln -s /usr/share/codium/bin/codium /usr/bin/codium
+update-alternatives --install /usr/bin/editor editor /usr/bin/codium 0
+"""
+
+
+def test_launcher_symlink_is_extracted():
+    from debfed.scripts import extract_symlinks
+
+    links = extract_symlinks({"postinst": VSCODIUM_LAUNCHER_POSTINST}, "codium")
+    assert links == [("/usr/bin/codium", "/usr/share/codium/bin/codium")]
+
+
+def test_shared_alternatives_slot_is_not_claimed():
+    """/usr/bin/editor is arbitrated by update-alternatives on Debian.
+    Claiming ownership of it in an rpm would collide with whatever else
+    provides that name."""
+    from debfed.scripts import extract_symlinks
+
+    links = dict(extract_symlinks({"postinst": VSCODIUM_LAUNCHER_POSTINST},
+                                  "codium"))
+    assert "/usr/bin/editor" not in links
+
+
+def test_links_outside_launcher_dirs_are_ignored():
+    from debfed.scripts import extract_symlinks
+
+    body = "#!/bin/sh\nln -sf /usr/share/app/x /etc/cron.d/app\n"
+    assert extract_symlinks({"postinst": body}, "app") == []
+
+
+def test_commented_out_link_is_ignored():
+    from debfed.scripts import extract_symlinks
+
+    body = "#!/bin/sh\n# ln -s /evil/thing /usr/bin/thing\n"
+    assert extract_symlinks({"postinst": body}, "thing") == []
+
+
+def test_removal_scripts_are_not_scanned():
+    """Only install-time scripts create launchers."""
+    from debfed.scripts import extract_symlinks
+
+    body = "#!/bin/sh\nln -s /usr/share/app/app /usr/bin/app\n"
+    assert extract_symlinks({"postrm": body}, "app") == []
+
+
+def test_launcher_is_materialised_into_the_package(tmp: Path):
+    from debfed.cli import _materialise_launchers
+
+    deb = make_deb(tmp, "myapp", "1.0-1",
+                   {"usr/share/myapp/bin/myapp": b"\x7fELF"},
+                   scripts={"postinst": "#!/bin/sh\n"
+                            "ln -s /usr/share/myapp/bin/myapp /usr/bin/myapp\n"})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    assert "/usr/bin/myapp" not in reloc.symlinks
+
+    created = _materialise_launchers(d, reloc)
+    assert created == ["/usr/bin/myapp"]
+    assert reloc.symlinks["/usr/bin/myapp"] == "/usr/share/myapp/bin/myapp"
+    assert (reloc.buildroot / "usr/bin/myapp").is_symlink()
+
+
+def test_launcher_pointing_outside_the_package_is_refused(tmp: Path):
+    """The target must be something this package actually ships."""
+    from debfed.cli import _materialise_launchers
+
+    deb = make_deb(tmp, "myapp", "1.0-1", {"usr/share/myapp/bin/myapp": b"x"},
+                   scripts={"postinst": "#!/bin/sh\n"
+                            "ln -s /opt/elsewhere/myapp /usr/bin/myapp\n"})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    assert _materialise_launchers(d, reloc) == []

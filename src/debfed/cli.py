@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -40,7 +41,7 @@ from .layout import Relocation, relocate
 from .refuse import SAFE_TRIGGERS, Assessment, Severity, Verdict, assess
 from .runtime import probe as probe_host
 from .sanitize import UnsafeInput
-from .scripts import ScriptPlan, analyse_scripts
+from .scripts import ScriptPlan, analyse_scripts, extract_symlinks
 from .spec import plan_spec, render
 
 BOLD, DIM, RED, YELLOW, GREEN, RESET = (
@@ -67,6 +68,32 @@ class Analysis:
         self.offline = offline
 
 
+def _materialise_launchers(deb: Deb, reloc: Relocation) -> list[str]:
+    """Create, inside the buildroot, the launcher symlinks a maintainer
+    script would have made, so rpm owns and removes them."""
+    created: list[str] = []
+    for link, target in extract_symlinks(deb.maintainer_scripts, deb.name):
+        if link in reloc.symlinks or link in reloc.files:
+            continue
+        # The target must be something this package actually ships.
+        if target not in reloc.files and target not in reloc.symlinks:
+            continue
+        path = reloc.buildroot / link.lstrip("/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink() or path.exists():
+            continue
+        os.symlink(target, path)
+        reloc.symlinks[link] = target
+        created.append(link)
+    if created:
+        reloc.dirs.extend(
+            d for d in {c.rsplit("/", 1)[0] for c in created}
+            if d not in reloc.dirs
+        )
+        reloc.dirs.sort()
+    return created
+
+
 def analyse(deb_path: Path, workdir: Path, *, offline: bool = False,
             map_file: Path | None = None,
             strict_scripts: bool = False) -> Analysis:
@@ -75,6 +102,12 @@ def analyse(deb_path: Path, workdir: Path, *, offline: bool = False,
     res = resolve(reloc.buildroot, offline=offline)
     assessment = assess(deb, reloc, res, strict_scripts=strict_scripts)
     scripts = analyse_scripts(deb.maintainer_scripts, deb.triggers, SAFE_TRIGGERS)
+
+    # Restore launchers the maintainer script would have created. Many
+    # vendor packages ship the application under /usr/share or /opt and
+    # create the /usr/bin entry in postinst, so without this the package
+    # installs correctly and is then not on PATH.
+    _materialise_launchers(deb, reloc)
 
     db = mapdb.load(map_file)
     extra_requires, unmapped = db.resolve_all([d.name for d in deb.depends])

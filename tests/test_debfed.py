@@ -1358,3 +1358,99 @@ def test_cosmetic_misses_yield_strategy_a(tmp: Path, monkeypatch):
     a = assess(dd, _empty_reloc(tmp), res)
     assert a.verdict is Verdict.STRATEGY_A, a.reason
     assert "symbol-version" in a.reason
+
+
+# =====================================================================
+# Host runtime contract.
+#
+# A .deb declares package dependencies. It does not declare what it
+# assumes about the running system -- that unprivileged user namespaces
+# work, that a session bus exists, that a display is reachable. Those
+# assumptions are invisible to dependency resolution and are where a
+# correctly-converted package still fails to start.
+# =====================================================================
+
+
+def test_userns_probe_prefers_the_distribution_specific_sysctl(monkeypatch):
+    """kernel.unprivileged_userns_clone is a Debian/Ubuntu/Arch patch and
+    does not exist upstream; Fedora exposes user.max_user_namespaces."""
+    from debfed import runtime
+
+    values = {}
+    monkeypatch.setattr(runtime, "_read_int", lambda p: values.get(p))
+
+    values.clear()
+    values["/proc/sys/user/max_user_namespaces"] = 15000
+    assert runtime.user_namespaces().available is True
+
+    values.clear()
+    values["/proc/sys/user/max_user_namespaces"] = 0
+    assert runtime.user_namespaces().available is False
+
+    values.clear()
+    values["/proc/sys/kernel/unprivileged_userns_clone"] = 0
+    assert runtime.user_namespaces().available is False
+
+
+def test_ubuntu_apparmor_restriction_blocks_namespaces(monkeypatch):
+    """Ubuntu 23.10+ restricts namespaces through AppArmor even when the
+    kernel permits them."""
+    from debfed import runtime
+
+    values = {
+        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns": 1,
+        "/proc/sys/user/max_user_namespaces": 15000,
+    }
+    monkeypatch.setattr(runtime, "_read_int", lambda p: values.get(p))
+    ns = runtime.user_namespaces()
+    assert ns.available is False
+    assert ns.mechanism == "apparmor"
+
+
+def test_dropped_sandbox_setuid_is_fine_with_namespaces(monkeypatch):
+    """With user namespaces available the helper is unnecessary at 0755.
+
+    A pre-emptive failure on the missing bit would break working installs.
+    """
+    from debfed import runtime
+
+    monkeypatch.setattr(runtime, "user_namespaces",
+                        lambda: runtime.UserNamespaces(True, "test", "ok"))
+    severity, _ = runtime.sandbox_outlook(has_setuid_helper=True,
+                                          setuid_preserved=False)
+    assert severity == "ok"
+
+
+def test_dropped_sandbox_setuid_is_fatal_without_namespaces(monkeypatch):
+    """With no namespaces the helper is the only sandbox; Chromium aborts
+    before opening a window."""
+    from debfed import runtime
+
+    monkeypatch.setattr(runtime, "user_namespaces",
+                        lambda: runtime.UserNamespaces(False, "test", "blocked"))
+    severity, explanation = runtime.sandbox_outlook(has_setuid_helper=True,
+                                                    setuid_preserved=False)
+    assert severity == "fatal"
+    assert "--no-sandbox" in explanation
+
+
+def test_package_without_a_sandbox_helper_is_unaffected(monkeypatch):
+    from debfed import runtime
+
+    monkeypatch.setattr(runtime, "user_namespaces",
+                        lambda: runtime.UserNamespaces(False, "test", "blocked"))
+    severity, _ = runtime.sandbox_outlook(has_setuid_helper=False,
+                                          setuid_preserved=False)
+    assert severity == "ok"
+
+
+def test_host_probe_is_read_only():
+    """Nothing in the probe may modify the system."""
+    import inspect as _inspect
+
+    from debfed import runtime
+
+    source = _inspect.getsource(runtime)
+    for forbidden in ("write_text(", "os.chmod", "subprocess.run",
+                      "sysctl -w", "os.remove"):
+        assert forbidden not in source, f"probe performs {forbidden}"

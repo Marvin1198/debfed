@@ -38,6 +38,7 @@ from .deb import Deb, DebError, unpack
 from .depsolve import Resolution, ResolveError, resolve
 from .layout import Relocation, relocate
 from .refuse import SAFE_TRIGGERS, Assessment, Severity, Verdict, assess
+from .runtime import probe as probe_host
 from .sanitize import UnsafeInput
 from .scripts import ScriptPlan, analyse_scripts
 from .spec import plan_spec, render
@@ -172,6 +173,12 @@ def print_inspect(an: Analysis, verbose: bool = False) -> None:
         if len(reloc.rewrites) > 20:
             w(f"    ... {len(reloc.rewrites) - 20} more\n")
 
+    if verbose:
+        host = probe_host()
+        w(f"\n  {_c('host runtime', DIM)}\n")
+        for key, value in host.as_dict().items():
+            w(f"    {key:<26} {value}\n")
+
     if a.findings:
         w("\n")
         for f in a.findings:
@@ -232,6 +239,7 @@ def as_dict(an: Analysis) -> dict:
              "message": f.message, "detail": f.detail}
             for f in an.assessment.findings
         ],
+        "host_runtime": probe_host().as_dict(),
         "verdict": an.assessment.verdict.value,
         "reason": an.assessment.reason,
     }

@@ -17,6 +17,7 @@ from enum import StrEnum
 from .deb import Deb, parse_depends
 from .depsolve import Resolution
 from .layout import Relocation
+from .runtime import sandbox_outlook
 
 
 class Verdict(StrEnum):
@@ -422,14 +423,34 @@ def assess(
 
     setuid_paths = reloc.setuid or deb.payload_setuid
     if setuid_paths:
+        # A dropped setuid bit is not a failure by itself. Chromium and
+        # every Electron application sandbox through either a setuid
+        # chrome-sandbox helper or unprivileged user namespaces; with
+        # namespaces available the helper is unnecessary at 0755. It only
+        # matters when namespaces are unavailable, and then it is the
+        # application's only sandbox. So probe the host rather than warn
+        # unconditionally.
+        is_sandbox_helper = any("chrome-sandbox" in p or "sandbox" in p
+                                for p in setuid_paths)
+        severity_name, explanation = sandbox_outlook(
+            has_setuid_helper=is_sandbox_helper, setuid_preserved=False
+        )
+        severity = {
+            "ok": Severity.WARN,
+            "warn": Severity.WARN,
+            "fatal": Severity.FATAL,
+        }[severity_name]
+        headline = (
+            "payload ships a setuid sandbox helper; the bit was dropped"
+            if is_sandbox_helper
+            else "payload declares setuid/setgid files; the bits were dropped"
+        )
         findings.append(
             Finding(
-                Severity.WARN, "SETUID",
-                "payload declares setuid/setgid files; the bits were dropped",
-                ", ".join(setuid_paths[:8])
-                + "\n    debfed extracts with tarfile's data filter, which clears "
-                "these bits. An app relying on a SUID helper (a legacy "
-                "chrome-sandbox, for example) will need user namespaces instead.",
+                severity,
+                "SANDBOX" if is_sandbox_helper else "SETUID",
+                headline,
+                ", ".join(setuid_paths[:8]) + "\n    " + explanation,
             )
         )
 

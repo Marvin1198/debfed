@@ -313,7 +313,8 @@ def _build(an: Analysis, workdir: Path, quiet: bool):
     strategy = "A" if an.assessment.verdict is Verdict.STRATEGY_A else "B"
     if strategy == "B":
         _bundle_for_strategy_b(an)
-    plan = plan_spec(an.deb, an.reloc, an.scripts, strategy, an.extra_requires)
+    plan = plan_spec(an.deb, an.reloc, an.scripts, strategy,
+                     an.extra_requires, resolution=an.res)
     spec_text = render(plan, an.reloc.buildroot)
     result = build_rpm(spec_text, an.reloc.buildroot, plan.name, workdir,
                        quiet=quiet)
@@ -345,13 +346,13 @@ def cmd_build(args: argparse.Namespace) -> int:
 
         if args.spec_only:
             plan = plan_spec(an.deb, an.reloc, an.scripts, strategy,
-                             an.extra_requires)
+                             an.extra_requires, resolution=an.res)
             sys.stdout.write(render(plan, an.reloc.buildroot))
             return 0
 
         try:
             plan = plan_spec(an.deb, an.reloc, an.scripts, strategy,
-                             an.extra_requires)
+                             an.extra_requires, resolution=an.res)
             spec_text = render(plan, an.reloc.buildroot)
             result = build_rpm(spec_text, an.reloc.buildroot, plan.name, tmp,
                                quiet=not args.verbose)

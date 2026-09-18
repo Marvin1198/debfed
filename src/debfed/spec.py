@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .deb import Deb
+from .depsolve import Resolution
 from .layout import UNOWNABLE_DIRS, Relocation
 from .sanitize import (
     safe_name,
@@ -106,6 +107,7 @@ class SpecPlan:
     scripts: ScriptPlan
     strategy: str                     # "A" or "B"
     extra_requires: list[str] = field(default_factory=list)
+    resolution: Resolution | None = None
     license: str = "Unspecified"
     vendor_prefix: str | None = None
     excluded_dirs: list[str] = field(default_factory=list)
@@ -125,13 +127,25 @@ def plan_spec(
     scripts: ScriptPlan,
     strategy: str,
     extra_requires: list[str] | None = None,
+    resolution: Resolution | None = None,
 ) -> SpecPlan:
+    """Plan the spec.
+
+    `resolution` is not optional in spirit. rpmbuild runs its own
+    dependency generator over the buildroot and knows nothing about the
+    analysis, so without it the generated package requires every
+    capability the analysis already established is bogus -- foreign
+    architectures, libraries the payload ships itself, symbol labels the
+    linker does not enforce. The verdict then says the package converts
+    cleanly while dnf refuses to install it.
+    """
     plan = SpecPlan(
         deb=deb,
         reloc=reloc,
         scripts=scripts,
         strategy=strategy,
         extra_requires=sorted(set(extra_requires or [])),
+        resolution=resolution,
         license=guess_license(deb),
     )
     if strategy == "B":
@@ -157,6 +171,71 @@ def _filter_regex(prefixes: list[str]) -> str:
         return ""
     alternatives = "|".join(re.escape(p) for p in prefixes)
     return f"^({alternatives})/.*$"
+
+
+def _cap_pattern(capability: str) -> str:
+    """A paren-free regex matching one rpm capability.
+
+    Parentheses cannot be used. rpm expands these macros before handing
+    them to regcomp, and escaped parens do not survive: an exclusion
+    written as ^libfoo\\.so\\.1\\(\\)\\(64bit\\)$ silently fails to match,
+    while the same pattern without parens works. Measured against
+    rpmbuild directly.
+
+    So the soname is escaped and the bracketed parts are matched with
+    '.' wildcards instead.
+    """
+    soname, _, rest = capability.partition("(")
+    pattern = re.escape(soname).replace("\\", "\\")
+    if not rest:
+        return "^" + pattern + "$"
+    # libfoo.so.1(SYMVER)(64bit) -> ^libfoo\.so\.1.SYMVER.*$
+    inner = rest.split(")", 1)[0]
+    if inner:
+        return "^" + pattern + "." + re.escape(inner) + ".*$"
+    return "^" + pattern + "..*$"
+
+
+def _requires_exclusions(plan: SpecPlan) -> tuple[str, str]:
+    """(path regex, capability regex) for rpm's requires generator.
+
+    rpm supports excluding by the file being scanned
+    (__requires_exclude_from) and by the generated capability string
+    (__requires_exclude). The analysis already knows which of each are
+    spurious; this is how that knowledge reaches the package.
+
+    Both regexes use top-level alternation (^a$|^b$) rather than a group
+    (^(a|b)$), because parentheses do not survive macro expansion.
+    """
+    res = plan.resolution
+    if res is None:
+        return "", ""
+
+    buildroot = str(plan.reloc.buildroot)
+    paths: list[str] = []
+    # Binaries for other architectures. Scanning them yields loaders no
+    # host of this architecture can provide: ld-linux-aarch64.so.1,
+    # ld-linux-armhf.so.3, ld64.so.2, plus their own glibc namespaces.
+    for files in (res.foreign or {}).values():
+        for f in files:
+            installed = f[len(buildroot):] if f.startswith(buildroot) else f
+            paths.append(re.escape(installed))
+    if plan.vendor_prefix:
+        paths.append(re.escape(plan.vendor_prefix) + "/lib/.*")
+
+    caps: list[str] = []
+    # Libraries the payload ships itself. rpm resolves these internally,
+    # but only if it is not also told to require them from outside.
+    caps.extend(_cap_pattern(c) for c in res.self_satisfied)
+    # Symbol labels the dynamic linker does not enforce, because the
+    # provider defines no versions at all. Only the versioned form is
+    # excluded; the bare soname requirement stays so dnf still pulls the
+    # library in.
+    caps.extend(_cap_pattern(c) for c in res.cosmetic_version_misses)
+
+    path_re = "|".join("^" + p + "$" for p in paths) if paths else ""
+    cap_re = "|".join(caps) if caps else ""
+    return path_re, cap_re
 
 
 def render(plan: SpecPlan, payload_dir: Path) -> str:
@@ -187,6 +266,18 @@ def render(plan: SpecPlan, payload_dir: Path) -> str:
     filter_prefixes = list(reloc.private_prefixes)
     if plan.vendor_prefix:
         filter_prefixes = [plan.vendor_prefix]
+
+    req_paths, req_caps = _requires_exclusions(plan)
+    if req_paths:
+        add("# Binaries for other architectures: their loaders and glibc")
+        add("# namespaces can never be satisfied on this one.")
+        add(f"%global __requires_exclude_from {req_paths}")
+    if req_caps:
+        add("# Capabilities the payload supplies itself, and symbol labels")
+        add("# the dynamic linker does not enforce.")
+        add(f"%global __requires_exclude {req_caps}")
+    if req_paths or req_caps:
+        add("")
 
     if filter_prefixes:
         regex = _filter_regex(filter_prefixes)

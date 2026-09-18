@@ -1454,3 +1454,87 @@ def test_host_probe_is_read_only():
     for forbidden in ("write_text(", "os.chmod", "subprocess.run",
                       "sysctl -w", "os.remove"):
         assert forbidden not in source, f"probe performs {forbidden}"
+
+
+# =====================================================================
+# The analysis must reach the generated package.
+#
+# rpmbuild runs its own dependency generator over the buildroot and
+# knows nothing about what inspect concluded. Without explicit
+# exclusions the package requires every capability the analysis already
+# established is bogus, so the verdict says "converts cleanly" while dnf
+# refuses to install it.
+# =====================================================================
+
+
+def test_capability_patterns_avoid_parentheses():
+    """Escaped parens do not survive rpm's macro expansion.
+
+    An exclusion written with \\( \\) silently fails to match, while the
+    same pattern using '.' wildcards works. Measured against rpmbuild.
+    """
+    from debfed.spec import _cap_pattern
+
+    for cap in ("libfoo.so.1()(64bit)", "libcurl.so.4(CURL_OPENSSL_4)(64bit)"):
+        pattern = _cap_pattern(cap)
+        assert "(" not in pattern, pattern
+        assert ")" not in pattern, pattern
+
+
+def test_capability_pattern_matches_what_it_should():
+    import re as _re
+
+    from debfed.spec import _cap_pattern
+
+    versioned = _cap_pattern("libcurl.so.4(CURL_OPENSSL_4)(64bit)")
+    assert _re.match(versioned, "libcurl.so.4(CURL_OPENSSL_4)(64bit)")
+    # the bare soname must survive, so dnf still pulls the library in
+    assert not _re.match(versioned, "libcurl.so.4()(64bit)")
+
+    bare = _cap_pattern("libffmpeg.so()(64bit)")
+    assert _re.match(bare, "libffmpeg.so()(64bit)")
+
+
+def test_spec_excludes_foreign_architecture_binaries(tmp: Path):
+    deb = make_deb(tmp, "mixed", "1.0-1", {
+        "usr/share/mixed/prog": _elf(0x3E),
+        "usr/share/mixed/vendor/arm64/helper": _elf(0xB7),
+    })
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    res = Resolution(foreign={"aarch64": [
+        str(reloc.buildroot / "usr/share/mixed/vendor/arm64/helper")]})
+    plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "A",
+                          resolution=res)
+    text = spec.render(plan, reloc.buildroot)
+    assert "__requires_exclude_from" in text
+    assert "/usr/share/mixed/vendor/arm64/helper" in text
+
+
+def test_spec_excludes_self_provided_and_cosmetic_capabilities(tmp: Path):
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": _elf(0x3E)})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    res = Resolution(
+        self_satisfied=["libffmpeg.so()(64bit)"],
+        satisfied={"libcurl.so.4()(64bit)": ["libcurl"]},
+        unsatisfied=["libcurl.so.4(CURL_OPENSSL_4)(64bit)"],
+    )
+    # force the cosmetic classification without touching the host
+    res.__dict__["_cosmetic"] = True
+    plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "A",
+                          resolution=res)
+    text = spec.render(plan, reloc.buildroot)
+    assert "__requires_exclude" in text
+    assert "libffmpeg" in text
+
+
+def test_plan_spec_without_resolution_emits_no_exclusions(tmp: Path):
+    """Callers that omit the resolution get the unfiltered behaviour,
+    which is wrong but must not crash."""
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": _elf(0x3E)})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "A")
+    text = spec.render(plan, reloc.buildroot)
+    assert "__requires_exclude_from" not in text

@@ -239,6 +239,45 @@ def max_required_glibc(requires: list[str]) -> tuple[int, ...] | None:
     return worst
 
 
+@lru_cache(maxsize=256)
+def provider_defines_symbol_versions(soname: str, package: str) -> bool | None:
+    """Does the Fedora package providing `soname` define symbol versions?
+
+    rpm's dependency generator emits one Provides entry per symbol
+    version a library defines, and none at all when the library is
+    unversioned. Measured on Fedora 44:
+
+        ncurses-compat-libs -> libtinfo.so.5()(64bit)          only
+        glibc               -> 102 x libc.so.6(GLIBC_x.y)(64bit)
+
+    So the repository metadata answers the question directly, without
+    the library needing to be installed. That matters: the provider is
+    very often a package dnf would install as part of the transaction,
+    so inspecting the local filesystem answers "not present" and tells
+    us nothing.
+
+    Returns None when the question cannot be answered.
+    """
+    try:
+        dnf = _dnf_bin()
+    except ResolveError:
+        return None
+    proc = subprocess.run(
+        [dnf, "repoquery", "--quiet", "--provides", package],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    prefix = soname + "("
+    entries = [line.strip() for line in proc.stdout.splitlines()
+               if line.strip().startswith(prefix)]
+    if not entries:
+        return None                      # provider does not mention it
+    # "libfoo.so.1()(64bit)" is the bare soname; anything else is a version
+    versioned = [e for e in entries if not e.startswith(soname + "()")]
+    return bool(versioned)
+
+
 @dataclass
 class Resolution:
     requires: list[str] = field(default_factory=list)
@@ -296,15 +335,34 @@ class Resolution:
         a "no version information available" warning, and the program
         runs. When the provider DOES define versions but not the
         required one, the load fails.
+
+        Repository metadata is consulted first. The provider is usually
+        a package dnf has not installed yet -- ncurses-compat-libs, for
+        instance -- so looking at the local filesystem answers "absent"
+        and classifies a perfectly ordinary case as unknown. rpm records
+        one Provides entry per defined symbol version, so the repo knows
+        the answer whether or not the file is on disk.
         """
         soname = cap.split("(", 1)[0]
+
+        for provider in self._providers_of(soname):
+            answer = provider_defines_symbol_versions(soname, provider)
+            if answer is not None:
+                return "real" if answer else "cosmetic"
+
+        # Fall back to a library that happens to be installed locally.
         lib = find_system_library(soname)
-        if lib is None:
-            return "unknown"
-        versioned = has_version_definitions(lib)
-        if versioned is None:
-            return "unknown"
-        return "real" if versioned else "cosmetic"
+        if lib is not None:
+            versioned = has_version_definitions(lib)
+            if versioned is not None:
+                return "real" if versioned else "cosmetic"
+        return "unknown"
+
+    def _providers_of(self, soname: str) -> list[str]:
+        """Fedora packages that satisfy this soname, from the resolution."""
+        bare = f"{soname}()(64bit)"
+        owners = self.satisfied.get(bare) or self.satisfied.get(soname) or []
+        return list(owners)
 
     @property
     def cosmetic_version_misses(self) -> list[str]:

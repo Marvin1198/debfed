@@ -1624,3 +1624,85 @@ def test_launcher_pointing_outside_the_package_is_refused(tmp: Path):
     d = unpack(deb, tmp / "w")
     reloc = layout.relocate(d.payload_dir, tmp / "br")
     assert _materialise_launchers(d, reloc) == []
+
+
+# =====================================================================
+# Symbol versioning, answered from repository metadata.
+#
+# rpm's dependency generator emits one Provides entry per symbol version
+# a library defines, and none when the library is unversioned. Measured
+# on Fedora 44: ncurses-compat-libs provides only libtinfo.so.5()(64bit),
+# glibc provides 102 x libc.so.6(GLIBC_x.y)(64bit).
+#
+# This matters because the provider is usually a package dnf has not
+# installed yet, so inspecting the local filesystem answers "absent" and
+# classifies an ordinary case as unknown.
+# =====================================================================
+
+
+def test_unversioned_provider_is_detected_from_metadata(monkeypatch):
+    """ncurses-compat-libs lists no versioned libtinfo entries."""
+    import debfed.depsolve as d
+
+    d.provider_defines_symbol_versions.cache_clear()
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout="libtinfo.so.5\nlibtinfo.so.5()(64bit)\n", stderr="")
+    monkeypatch.setattr(d.subprocess, "run", lambda *a, **k: fake)
+    monkeypatch.setattr(d, "_dnf_bin", lambda: "dnf")
+    assert d.provider_defines_symbol_versions(
+        "libtinfo.so.5", "ncurses-compat-libs") is False
+
+
+def test_versioned_provider_is_detected_from_metadata(monkeypatch):
+    """glibc lists a versioned entry for every symbol version."""
+    import debfed.depsolve as d
+
+    d.provider_defines_symbol_versions.cache_clear()
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=("libc.so.6()(64bit)\nlibc.so.6(GLIBC_2.0)\n"
+                "libc.so.6(GLIBC_2.34)(64bit)\n"), stderr="")
+    monkeypatch.setattr(d.subprocess, "run", lambda *a, **k: fake)
+    monkeypatch.setattr(d, "_dnf_bin", lambda: "dnf")
+    assert d.provider_defines_symbol_versions("libc.so.6", "glibc") is True
+
+
+def test_metadata_wins_over_a_missing_local_file(monkeypatch):
+    """The whole point: the provider is not installed yet.
+
+    Reading the local filesystem returns "absent", which previously
+    classified xterm's libtinfo misses as blocking and sent the package
+    to Strategy B for no reason.
+    """
+    import debfed.depsolve as d
+
+    d.provider_defines_symbol_versions.cache_clear()
+    monkeypatch.setattr(d, "provider_defines_symbol_versions",
+                        lambda soname, pkg: False)
+    monkeypatch.setattr(d, "find_system_library", lambda s: None)
+
+    res = Resolution(
+        satisfied={"libtinfo.so.5()(64bit)": ["ncurses-compat-libs"]},
+        unsatisfied=["libtinfo.so.5(NCURSES_TINFO_5.0.19991023)(64bit)"],
+    )
+    assert res.cosmetic_version_misses == [
+        "libtinfo.so.5(NCURSES_TINFO_5.0.19991023)(64bit)"]
+    assert res.blocking_unsatisfied == []
+
+
+def test_providers_are_taken_from_the_resolution():
+    res = Resolution(satisfied={"libtinfo.so.5()(64bit)": ["ncurses-compat-libs"]})
+    assert res._providers_of("libtinfo.so.5") == ["ncurses-compat-libs"]
+    assert res._providers_of("libnothing.so.1") == []
+
+
+def test_provider_not_mentioning_the_soname_is_inconclusive(monkeypatch):
+    import debfed.depsolve as d
+
+    d.provider_defines_symbol_versions.cache_clear()
+    fake = subprocess.CompletedProcess(args=[], returncode=0,
+                                       stdout="somethingelse\n", stderr="")
+    monkeypatch.setattr(d.subprocess, "run", lambda *a, **k: fake)
+    monkeypatch.setattr(d, "_dnf_bin", lambda: "dnf")
+    assert d.provider_defines_symbol_versions("libfoo.so.1", "pkg") is None

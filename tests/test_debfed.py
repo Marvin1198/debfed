@@ -1824,3 +1824,79 @@ def test_offline_build_produces_no_private_prefix(tmp: Path):
     plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "A")
     text = spec.render(plan, reloc.buildroot)
     assert "/opt/debfed" not in text
+
+
+# =====================================================================
+# Desktop integration.
+#
+# Opening a .deb from a file manager means escalating to root on
+# untrusted input. The IANA registration for the type says so directly:
+# "Debian binary packages can contain scripts executing arbitrary
+# commands during installation, which is done with administrator
+# privileges."
+#
+# debfed never runs those scripts, but the payload still lands as
+# root-owned files under /usr, so the escalation must always
+# authenticate and the transaction preview must stay visible.
+# =====================================================================
+
+DESKTOP_FILE = Path(__file__).parent.parent / "packaging" / "debfed.desktop"
+
+
+def _desktop_entry() -> dict:
+    import configparser
+
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    parser.read(DESKTOP_FILE)
+    return dict(parser["Desktop Entry"])
+
+
+def test_desktop_entry_registers_the_iana_mime_type():
+    entry = _desktop_entry()
+    types = [t for t in entry["MimeType"].split(";") if t]
+    assert "application/vnd.debian.binary-package" in types
+
+
+def test_desktop_entry_handles_one_package_at_a_time():
+    """%F would hand several packages to one invocation, approving
+    multiple installs from a single prompt."""
+    entry = _desktop_entry()
+    assert entry["Exec"].endswith("%f")
+    assert "%F" not in entry["Exec"]
+
+
+def test_desktop_entry_keeps_the_transaction_preview_visible():
+    """Terminal=true is a security decision.
+
+    A polkit policy permitting "install this .deb" without
+    authentication would be a local privilege escalation by design: the
+    payload lands as root-owned files under /usr, so any local user
+    could craft a package dropping a setuid binary. Running in a
+    terminal keeps the escalation as ordinary sudo and keeps the dnf
+    transaction preview -- the core safety property -- on screen.
+    """
+    entry = _desktop_entry()
+    assert entry["Terminal"].lower() == "true"
+
+
+def test_desktop_entry_ships_no_privileged_helper():
+    """No polkit policy, no setuid helper, no new privileged surface."""
+    entry = _desktop_entry()
+    for forbidden in ("pkexec", "sudo", "su -c", "polkit"):
+        assert forbidden not in entry["Exec"], entry["Exec"]
+
+
+def test_desktop_entry_is_a_handler_not_a_launcher():
+    entry = _desktop_entry()
+    assert entry["NoDisplay"].lower() == "true"
+
+
+def test_desktop_entry_is_valid():
+    """Skipped where desktop-file-validate is unavailable."""
+    validator = shutil.which("desktop-file-validate")
+    if validator is None:
+        pytest.skip("desktop-file-utils not installed")
+    proc = subprocess.run([validator, str(DESKTOP_FILE)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr

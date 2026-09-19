@@ -33,6 +33,7 @@ from .build import (
     dnf_remove,
     find_conflicts,
     rpm_query_installed,
+    verify_requires,
 )
 from .bundle import BundleError, apply_bundle, plan_bundle, verify_bundle
 from .deb import Deb, DebError, unpack
@@ -343,7 +344,12 @@ def _bundle_for_strategy_b(an: Analysis) -> list[str]:
 
 
 def _build(an: Analysis, workdir: Path, quiet: bool):
-    strategy = "A" if an.assessment.verdict is Verdict.STRATEGY_A else "B"
+    # UNKNOWN means dependency resolution was skipped (--offline), not
+    # that bundling is needed. Treating it as B declares a private prefix
+    # that nothing ever populates, and rpmbuild then fails on the missing
+    # directory.
+    strategy = ("A" if an.assessment.verdict in
+                (Verdict.STRATEGY_A, Verdict.UNKNOWN) else "B")
     if strategy == "B":
         _bundle_for_strategy_b(an)
     plan = plan_spec(an.deb, an.reloc, an.scripts, strategy,
@@ -351,6 +357,19 @@ def _build(an: Analysis, workdir: Path, quiet: bool):
     spec_text = render(plan, an.reloc.buildroot)
     result = build_rpm(spec_text, an.reloc.buildroot, plan.name, workdir,
                        quiet=quiet)
+
+    # The artifact is the only thing the user receives, so check it rather
+    # than trusting that the analysis reached it.
+    still_unsatisfiable = verify_requires(result.rpm_path,
+                                          an.res.blocking_unsatisfied)
+    if still_unsatisfiable:
+        raise BundleError(
+            "the built package still requires capabilities nothing provides:\n  "
+            + "\n  ".join(still_unsatisfiable)
+            + "\n\nThese are not in the payload, so a private prefix cannot "
+            "supply them either. Refusing rather than handing over an rpm "
+            "that dnf will reject."
+        )
     return plan, spec_text, result
 
 
@@ -384,11 +403,12 @@ def cmd_build(args: argparse.Namespace) -> int:
             return 0
 
         try:
-            plan = plan_spec(an.deb, an.reloc, an.scripts, strategy,
-                             an.extra_requires, resolution=an.res)
-            spec_text = render(plan, an.reloc.buildroot)
-            result = build_rpm(spec_text, an.reloc.buildroot, plan.name, tmp,
-                               quiet=not args.verbose)
+            # Must go through _build: it performs the Strategy B bundling
+            # step. An earlier version of this function reimplemented the
+            # pipeline inline and silently skipped it, so `build` produced
+            # RPMs that required libraries nothing provides and still
+            # exited 0.
+            _plan, _spec_text, result = _build(an, tmp, quiet=not args.verbose)
         except UnsafeInput as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1

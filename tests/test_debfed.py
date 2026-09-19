@@ -1706,3 +1706,89 @@ def test_provider_not_mentioning_the_soname_is_inconclusive(monkeypatch):
     monkeypatch.setattr(d.subprocess, "run", lambda *a, **k: fake)
     monkeypatch.setattr(d, "_dnf_bin", lambda: "dnf")
     assert d.provider_defines_symbol_versions("libfoo.so.1", "pkg") is None
+
+
+# =====================================================================
+# The artifact must be checked, not just the analysis.
+#
+# The analysis and the generated package are produced by different code
+# and have drifted twice: once when the spec did not carry the
+# analysis's exclusions, and once when `build` reimplemented the
+# pipeline and skipped Strategy B bundling. Both times debfed reported
+# success and produced an rpm dnf refused to install.
+# =====================================================================
+
+
+def test_build_and_install_share_one_pipeline():
+    """cmd_build reimplemented the pipeline inline and skipped bundling,
+    so `build` produced RPMs requiring libraries nothing provides."""
+    import inspect as _inspect
+
+    from debfed import cli
+
+    source = _inspect.getsource(cli.cmd_build)
+    assert "_build(an, tmp" in source, "cmd_build must not reimplement _build"
+    assert "build_rpm(" not in source, "cmd_build calls build_rpm directly again"
+
+
+def test_verify_requires_flags_unsatisfiable_capabilities(tmp: Path):
+    from unittest import mock
+
+    from debfed.build import verify_requires
+
+    listing = ("libc.so.6()(64bit)\n"
+               "libgspell-1.so.2()(64bit)\n"
+               "rtld(GNU_HASH)\n")
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=listing,
+                                       stderr="")
+    with mock.patch("debfed.build.subprocess.run", return_value=fake), \
+         mock.patch("debfed.build.shutil.which", return_value="/usr/bin/rpm"):
+        left = verify_requires(tmp / "x.rpm", ["libgspell-1.so.2()(64bit)"])
+    assert left == ["libgspell-1.so.2()(64bit)"]
+
+
+def test_verify_requires_passes_a_clean_package(tmp: Path):
+    from unittest import mock
+
+    from debfed.build import verify_requires
+
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="libc.so.6()(64bit)\n", stderr="")
+    with mock.patch("debfed.build.subprocess.run", return_value=fake), \
+         mock.patch("debfed.build.shutil.which", return_value="/usr/bin/rpm"):
+        assert verify_requires(tmp / "x.rpm", ["libgspell-1.so.2()(64bit)"]) == []
+
+
+def test_strategy_b_refuses_a_library_not_in_the_payload(tmp: Path):
+    """gedit needs libgspell-1.so.2, which Fedora does not have and the
+    package does not ship. A private prefix cannot invent it."""
+    from debfed.bundle import plan_bundle
+
+    (tmp / "br").mkdir()
+    plan = plan_bundle("gedit", ["libgspell-1.so.2()(64bit)"], tmp / "br")
+    assert plan.unresolved == ["libgspell-1.so.2()(64bit)"]
+    assert not plan.viable
+
+
+def test_unknown_verdict_does_not_trigger_bundling(tmp: Path):
+    """--offline yields UNKNOWN, which means resolution was skipped, not
+    that a private prefix is needed. Treating it as Strategy B declared
+    /opt/debfed/<app> directories nothing ever created, and every offline
+    build then failed in rpmbuild."""
+    import inspect as _inspect
+
+    from debfed import cli
+
+    source = _inspect.getsource(cli._build)
+    assert "Verdict.UNKNOWN" in source, (
+        "_build must treat UNKNOWN as Strategy A"
+    )
+
+
+def test_offline_build_produces_no_private_prefix(tmp: Path):
+    deb = make_deb(tmp, "offlineapp", "1.0-1", {"usr/bin/offlineapp": _elf(0x3E)})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "A")
+    text = spec.render(plan, reloc.buildroot)
+    assert "/opt/debfed" not in text

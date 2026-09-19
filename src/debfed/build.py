@@ -156,6 +156,31 @@ def build_rpm(
 # ------------------------------------------------------------------ install
 
 
+def verify_requires(rpm_path: Path, blocking: list[str]) -> list[str]:
+    """Capabilities the built RPM still requires that nothing can satisfy.
+
+    The analysis and the generated package are produced by different
+    code, and they have drifted twice: once when the spec did not carry
+    the analysis's exclusions, and once when `build` reimplemented the
+    pipeline and skipped bundling. Both times debfed reported success
+    and produced an RPM dnf refused to install.
+
+    Reading the finished artifact is the only check that cannot drift,
+    because it inspects the thing the user actually receives.
+    """
+    rpm_bin = shutil.which("rpm")
+    if not rpm_bin or not blocking:
+        return []
+    proc = subprocess.run(
+        [rpm_bin, "-qp", "--requires", str(rpm_path)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    present = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    return sorted(present & set(blocking))
+
+
 def dnf_install(rpm_path: Path, *, assume_yes: bool, test: bool = False) -> int:
     """Hand the built rpm to dnf so it owns resolution and the transaction."""
     dnf = _require("dnf", "dnf")

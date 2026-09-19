@@ -108,6 +108,7 @@ class SpecPlan:
     strategy: str                     # "A" or "B"
     extra_requires: list[str] = field(default_factory=list)
     resolution: Resolution | None = None
+    bundled: list[str] = field(default_factory=list)
     license: str = "Unspecified"
     vendor_prefix: str | None = None
     excluded_dirs: list[str] = field(default_factory=list)
@@ -314,7 +315,17 @@ def render(plan: SpecPlan, payload_dir: Path) -> str:
 
     if plan.vendor_prefix:
         add(f"# Strategy B: self-contained under {plan.vendor_prefix}")
-        add("Provides:       bundled(debfed-prefix) = %{version}")
+        # Fedora's bundled software policy: a package carrying bundled
+        # libraries must declare each one, so the distribution can find
+        # every copy when the library has a security fix.
+        add("#")
+        add("# Fedora bundled software policy requires each bundled library")
+        add("# to be declared, so a security fix can be traced to every copy.")
+        for soname in sorted(plan.bundled):
+            name = soname.split(".so")[0]
+            add(f"Provides:       bundled({spec_value(name, limit=80)})")
+        if not plan.bundled:
+            add("Provides:       bundled(debfed-prefix) = %{version}")
         add("")
 
     add("%description")

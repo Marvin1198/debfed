@@ -67,6 +67,9 @@ class Analysis:
         self.extra_requires = extra_requires
         self.unmapped = unmapped
         self.offline = offline
+        # Sonames copied into the private prefix, so the spec can declare
+        # each one as Fedora's bundled software policy requires.
+        self.bundled_sonames: list[str] = []
 
 
 def _materialise_launchers(deb: Deb, reloc: Relocation) -> list[str]:
@@ -331,6 +334,7 @@ def _bundle_for_strategy_b(an: Analysis) -> list[str]:
             "bundle did not resolve: " + ", ".join(remaining[:4])
             + "\n  Refusing rather than shipping a package that cannot start."
         )
+    an.bundled_sonames = sorted(plan.sources)
     an.reloc.files.extend(added)
     an.reloc.files.sort()
     prefix = plan.prefix
@@ -354,6 +358,7 @@ def _build(an: Analysis, workdir: Path, quiet: bool):
         _bundle_for_strategy_b(an)
     plan = plan_spec(an.deb, an.reloc, an.scripts, strategy,
                      an.extra_requires, resolution=an.res)
+    plan.bundled = sorted(an.bundled_sonames)
     spec_text = render(plan, an.reloc.buildroot)
     result = build_rpm(spec_text, an.reloc.buildroot, plan.name, workdir,
                        quiet=quiet)

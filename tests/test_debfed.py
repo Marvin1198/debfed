@@ -354,12 +354,44 @@ def test_toolkit_gap_refused(tmp: Path):
 
 
 def test_leaf_gap_falls_to_strategy_b(tmp: Path):
-    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"x"})
+    """Strategy B applies only when the package actually ships the library."""
+    deb = make_deb(tmp, "app", "1.0-1", {
+        "usr/bin/app": b"x",
+        "usr/share/app/libcurious.so.7": b"\x7fELF",
+    })
     d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
     res = Resolution(requires=["libcurious.so.7()(64bit)"],
                      unsatisfied=["libcurious.so.7()(64bit)"])
-    a = assess(d, _empty_reloc(tmp), res)
-    assert a.verdict is Verdict.STRATEGY_B
+    a = assess(d, reloc, res)
+    assert a.verdict is Verdict.STRATEGY_B, a.reason
+
+
+def test_leaf_gap_without_a_shipped_library_is_refused(tmp: Path):
+    """gedit needs libgspell-1.so.2, which Fedora lacks and the package
+    does not ship. Promising Strategy B and failing at build time told
+    the user one step too late."""
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"x"})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    res = Resolution(requires=["libabsent.so.9()(64bit)"],
+                     unsatisfied=["libabsent.so.9()(64bit)"])
+    a = assess(d, reloc, res)
+    assert a.verdict is Verdict.REFUSE
+    assert any(f.code == "UNOBTAINABLE" for f in a.fatal)
+    assert "libabsent.so.9" in a.reason
+
+
+def test_bundled_libraries_are_declared(tmp: Path):
+    """Fedora policy: a package carrying bundled libraries must declare
+    each one, so a security fix can be traced to every copy."""
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": b"x"})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "B")
+    plan.bundled = ["libcurious.so.7"]
+    text = spec.render(plan, reloc.buildroot)
+    assert "Provides:       bundled(libcurious)" in text
 
 
 def test_unchecked_resolution_never_claims_a_strategy(tmp: Path):

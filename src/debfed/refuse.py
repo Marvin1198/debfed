@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 
+from .bundle import plan_bundle
 from .deb import Deb, parse_depends
 from .depsolve import Resolution
 from .layout import Relocation
@@ -501,6 +502,31 @@ def assess(
             reason += (f" ({len(cosmetic)} symbol-version label(s) absent; the "
                        "linker only warns)")
         return Assessment(Verdict.STRATEGY_A, findings, reason)
+
+    # A private prefix can only supply a library the package actually
+    # ships. Nothing sanctions fetching one from Debian: a bundled
+    # library has no security update path, which is the whole reason
+    # distributions discourage bundling. So check now rather than
+    # promising Strategy B and admitting at build time that it cannot be
+    # done.
+    bundle = plan_bundle(deb.name, blocking, reloc.buildroot)
+    if bundle.unresolved:
+        findings.append(
+            Finding(
+                Severity.FATAL, "UNOBTAINABLE",
+                f"{len(bundle.unresolved)} requirement(s) are neither on this "
+                "system nor in the package",
+                ", ".join(bundle.unresolved[:6])
+                + "\n    A private prefix can only bundle libraries the "
+                "package ships. These come from other Debian packages, so "
+                "there is nothing to copy. Use the Fedora build of this "
+                "application if one exists, or a container.",
+            )
+        )
+        return Assessment(
+            Verdict.REFUSE, findings,
+            f"{bundle.unresolved[0]} is not available and not bundled",
+        )
 
     if not allow_private_prefix:
         findings.append(

@@ -1866,18 +1866,28 @@ def test_desktop_entry_handles_one_package_at_a_time():
     assert "%F" not in entry["Exec"]
 
 
-def test_desktop_entry_keeps_the_transaction_preview_visible():
-    """Terminal=true is a security decision.
+def test_graphical_flow_still_shows_the_report_before_installing():
+    """The preview is the core safety property and survived the move to
+    a graphical flow; only where it is displayed changed.
 
-    A polkit policy permitting "install this .deb" without
-    authentication would be a local privilege escalation by design: the
-    payload lands as root-owned files under /usr, so any local user
-    could craft a package dropping a setuid binary. Running in a
-    terminal keeps the escalation as ordinary sudo and keeps the dnf
-    transaction preview -- the core safety property -- on screen.
+    The escalation itself is still gated: the polkit action requires
+    administrator authentication in every mode, so a package cannot be
+    installed by clicking alone.
     """
-    entry = _desktop_entry()
-    assert entry["Terminal"].lower() == "true"
+    from debfed import gui
+
+    source = __import__("inspect").getsource(gui.install)
+    assert "print_inspect" in source, "the report is no longer generated"
+
+    # Compare call sites, not the import line at the top of the function.
+    def call_line(needle: str) -> int:
+        for number, line in enumerate(source.splitlines()):
+            if needle in line and not line.strip().startswith(("from ", "import ")):
+                return number
+        raise AssertionError(f"{needle} is never called")
+
+    assert call_line("_confirm(") < call_line("_build(")
+    assert call_line("_build(") < call_line("_escalate_and_install(")
 
 
 def test_desktop_entry_ships_no_privileged_helper():
@@ -1900,3 +1910,115 @@ def test_desktop_entry_is_valid():
     proc = subprocess.run([validator, str(DESKTOP_FILE)],
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# =====================================================================
+# Graphical install: privilege separation.
+#
+# Converting a .deb needs no root -- reading the archive, resolving
+# dependencies, generating the spec and building the RPM all happen as
+# the calling user. Only handing the finished package to dnf requires
+# privilege, so that is the only step that escalates.
+#
+# The polkit action is the one genuinely new privileged surface in this
+# project, and these tests exist to keep it narrow.
+# =====================================================================
+
+POLICY = Path(__file__).parent.parent / "packaging" / "com.github.debfed.policy"
+HELPER_SRC = Path(__file__).parent.parent / "packaging" / "debfed-install"
+
+
+def test_polkit_policy_always_requires_authentication():
+    """A permissive polkit rule on a package-install action is
+    CVE-2026-41651: any local user installs an arbitrary RPM without a
+    password, and its %post scriptlet runs as root."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(POLICY).getroot()
+    actions = root.findall("action")
+    assert actions, "policy defines no actions"
+    for action in actions:
+        defaults = action.find("defaults")
+        assert defaults is not None, action.get("id")
+        for mode in ("allow_any", "allow_inactive", "allow_active"):
+            element = defaults.find(mode)
+            assert element is not None, f"{action.get('id')} omits {mode}"
+            assert element.text == "auth_admin", (
+                f"{action.get('id')} {mode} is {element.text!r}, "
+                "which does not require authentication"
+            )
+
+
+def test_polkit_policy_points_at_the_narrow_helper():
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(POLICY).getroot()
+    action = root.find("action")
+    paths = [a.text for a in action.findall("annotate")
+             if a.get("key") == "org.freedesktop.policykit.exec.path"]
+    assert paths == ["/usr/bin/debfed-install"], paths
+    # never the general-purpose entry point
+    assert "/usr/bin/debfed" not in paths
+
+
+def test_helper_accepts_nothing_but_an_rpm_path():
+    """The helper must not take a .deb, a spec, a script or a command."""
+    source = HELPER_SRC.read_text()
+    assert "RPM_MAGIC" in source
+    assert "shell=True" not in source
+    for forbidden in ("os.system", "eval(", "exec("):
+        assert forbidden not in source, forbidden
+
+
+def test_helper_refuses_relative_paths(tmp: Path):
+    proc = subprocess.run([sys.executable, str(HELPER_SRC), "relative.rpm"],
+                          capture_output=True, text=True)
+    assert proc.returncode == 2
+    assert "absolute" in proc.stderr
+
+
+def test_helper_refuses_a_file_that_is_not_an_rpm(tmp: Path):
+    decoy = tmp / "notanrpm.rpm"
+    decoy.write_bytes(b"#!/bin/sh\nid\n")
+    proc = subprocess.run([sys.executable, str(HELPER_SRC), str(decoy)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 2
+    assert "not an RPM package" in proc.stderr
+
+
+def test_helper_refuses_too_many_arguments(tmp: Path):
+    proc = subprocess.run(
+        [sys.executable, str(HELPER_SRC), "/tmp/a.rpm", "/tmp/b.rpm"],
+        capture_output=True, text=True)
+    assert proc.returncode == 2
+    assert "usage" in proc.stderr
+
+
+def test_desktop_entry_uses_the_graphical_flow():
+    entry = _desktop_entry()
+    assert entry["Exec"] == "debfed gui-install %f"
+    assert entry["Terminal"].lower() == "false"
+
+
+def test_gui_never_handles_a_password():
+    """An application that collects the password itself is
+    indistinguishable from a phishing dialog. pkexec reports authorised
+    or not, and nothing more."""
+    from debfed import gui
+
+    source = __import__("inspect").getsource(gui)
+    for forbidden in ("sudo -S", "getpass", "--password", "stdin=", "askpass"):
+        assert forbidden not in source, forbidden
+    assert "pkexec" in source
+
+
+def test_gui_escalates_only_for_the_install_step():
+    from debfed import gui
+
+    source = __import__("inspect").getsource(gui._escalate_and_install)
+    assert "PKEXEC" in source
+    # conversion happens before, unprivileged
+    install_source = __import__("inspect").getsource(gui.install)
+    build_at = install_source.index("_build(")
+    escalate_at = install_source.index("_escalate_and_install(")
+    assert build_at < escalate_at

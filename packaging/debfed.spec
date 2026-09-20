@@ -23,6 +23,11 @@ Requires:       python3-pyyaml
 Requires:       dnf
 # Strategy B rewrites RPATH on bundled binaries.
 Requires:       patchelf
+# The graphical flow: pkexec presents the system authentication dialog,
+# zenity shows the report. Recommends rather than Requires, because the
+# command line works without either.
+Recommends:     polkit
+Recommends:     zenity
 # Needed only on Python < 3.14, where tarfile cannot read zstd payloads.
 Recommends:     zstd
 
@@ -64,9 +69,23 @@ desktop-file-install \
     --dir=%{buildroot}%{_datadir}/applications \
     packaging/debfed.desktop
 
+# The privileged helper and its polkit action. The helper is the only
+# part of debfed that ever runs as root, and the action requires
+# administrator authentication for every install.
+install -Dpm 0755 packaging/debfed-install %{buildroot}%{_bindir}/debfed-install
+install -Dpm 0644 packaging/com.github.debfed.policy \
+    %{buildroot}%{_datadir}/polkit-1/actions/com.github.debfed.policy
+
 %check
 %pytest tests/ -q
 desktop-file-validate %{buildroot}%{_datadir}/applications/debfed.desktop
+
+# The policy must require authentication in every mode. A permissive
+# polkit rule on a package-install action is CVE-2026-41651.
+if grep -q '>yes<' %{buildroot}%{_datadir}/polkit-1/actions/com.github.debfed.policy; then
+    echo "polkit policy grants an install action without authentication" >&2
+    exit 1
+fi
 
 %post
 update-desktop-database &>/dev/null || :
@@ -78,7 +97,9 @@ update-desktop-database &>/dev/null || :
 %doc README.md SECURITY.md
 %license LICENSE
 %{_bindir}/debfed
+%{_bindir}/debfed-install
 %{_datadir}/applications/debfed.desktop
+%{_datadir}/polkit-1/actions/com.github.debfed.policy
 %{_mandir}/man1/debfed.1*
 
 %changelog

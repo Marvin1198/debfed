@@ -502,6 +502,13 @@ def cmd_install(args: argparse.Namespace) -> int:
         return dnf_install(result.rpm_path, assume_yes=True)
 
 
+def cmd_gui_install(args: argparse.Namespace) -> int:
+    """Graphical flow, used when a package is opened from a file manager."""
+    from .gui import install as gui_install
+
+    return gui_install(args.deb, verbose=args.verbose)
+
+
 def cmd_remove(args: argparse.Namespace) -> int:
     installed = rpm_query_installed(args.name)
     if not installed:
@@ -606,6 +613,14 @@ def build_parser() -> argparse.ArgumentParser:
     ins.add_argument("--dry-run", action="store_true", help="stop after the dry run")
     ins.add_argument("-v", "--verbose", action="store_true")
     ins.set_defaults(func=cmd_install)
+
+    gui = sub.add_parser(
+        "gui-install", parents=[common],
+        help="convert and install with a graphical prompt (used by the "
+             "file-manager association)")
+    gui.add_argument("deb", type=Path)
+    gui.add_argument("-v", "--verbose", action="store_true")
+    gui.set_defaults(func=cmd_gui_install)
 
     rm = sub.add_parser("remove", help="remove an installed package via dnf")
     rm.add_argument("name")

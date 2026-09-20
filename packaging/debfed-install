@@ -1,0 +1,87 @@
+#!/usr/bin/python3 -Es
+"""Install one already-built RPM. The only part of debfed that runs as root.
+
+Invoked through pkexec, gated by the polkit action
+com.github.debfed.install-rpm, which requires administrator
+authentication every time.
+
+This is deliberately tiny and does exactly one thing. Everything
+interesting -- reading the .deb, analysing dependencies, generating the
+spec, building the package -- happens unprivileged as the calling user,
+because none of it needs root. Only handing a finished RPM to dnf does.
+
+Nothing here accepts a package to convert, a spec, a script, or a shell
+command. It takes a path to an RPM file and nothing else.
+
+The shebang uses -Es on purpose: -E ignores PYTHONPATH and friends, -s
+ignores the user site directory. pkexec sanitises the environment
+already, but a root helper should not depend on that being true.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# The first four bytes of every RPM file.
+RPM_MAGIC = b"\xed\xab\xee\xdb"
+
+USAGE = "usage: debfed-install /path/to/package.rpm"
+
+
+def fail(message: str) -> None:
+    print(f"debfed-install: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1:
+        fail(USAGE)
+
+    raw = argv[0]
+    if not raw.startswith("/"):
+        fail("the package path must be absolute")
+
+    path = Path(raw)
+
+    # Resolve once, then operate on the resolved path only. Checking one
+    # path and opening another is how these helpers get exploited.
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        fail(f"cannot resolve {raw}: {exc}")
+
+    if not resolved.is_file():
+        fail(f"not a regular file: {resolved}")
+
+    try:
+        with resolved.open("rb") as handle:
+            magic = handle.read(4)
+    except OSError as exc:
+        fail(f"cannot read {resolved}: {exc}")
+
+    if magic != RPM_MAGIC:
+        fail(f"not an RPM package: {resolved}")
+
+    dnf = "/usr/bin/dnf5" if Path("/usr/bin/dnf5").exists() else "/usr/bin/dnf"
+    if not Path(dnf).exists():
+        fail("dnf not found")
+
+    # No shell. The path is passed as a single argument.
+    proc = subprocess.run(
+        [dnf, "install", "-y", str(resolved)],
+        env={
+            "PATH": "/usr/sbin:/usr/bin",
+            "LC_ALL": "C.UTF-8",
+            "HOME": "/root",
+        },
+    )
+    return proc.returncode
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        fail("this helper must be run through pkexec, not directly")
+    sys.exit(main(sys.argv[1:]))

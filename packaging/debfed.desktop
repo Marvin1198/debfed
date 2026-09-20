@@ -9,7 +9,7 @@ Keywords=deb;debian;package;install;convert;
 # %f, not %F: one package at a time. Each conversion prints its own
 # transaction preview, and batching them would mean approving several
 # installs from a single prompt.
-Exec=debfed install %f
+Exec=debfed gui-install %f
 TryExec=debfed
 
 Icon=system-software-install
@@ -21,21 +21,16 @@ Categories=System;
 # some browsers and download tools.
 MimeType=application/vnd.debian.binary-package;application/x-deb;application/x-debian-package;
 
-# Terminal=true is a deliberate security decision, not a shortcut.
+# No terminal: gui-install converts as the calling user, shows the full
+# report in a dialog, and escalates exactly once through pkexec, which
+# presents the system's own authentication prompt.
 #
-# The alternative is a polkit policy, and a rule permitting "install this
-# .deb" without authentication would be a local privilege escalation by
-# design: debfed never runs maintainer scripts, but the payload still
-# lands as root-owned files under /usr, so any local user could craft a
-# package that drops a setuid binary.
+# The preview is still shown before anything is installed -- that is the
+# core safety property of this tool and is not traded away for
+# convenience. What changed is only where it is displayed.
 #
-# Running in a terminal means the escalation is ordinary sudo, with no
-# new privileged component, and the user reads the dnf transaction
-# preview before approving it. That preview is the core safety property
-# of this tool; hiding it behind a graphical "Install" button would
-# remove the one thing that makes converting a foreign package
-# defensible.
-Terminal=true
+# debfed never handles a password. pkexec reports authorised or not.
+Terminal=false
 
 # A file handler, not something to launch on its own. Without this it
 # appears in the applications grid and does nothing useful when clicked.

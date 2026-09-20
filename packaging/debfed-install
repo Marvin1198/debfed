@@ -65,6 +65,17 @@ def main(argv: list[str]) -> int:
     if magic != RPM_MAGIC:
         fail(f"not an RPM package: {resolved}")
 
+    # Validation above needs no privilege and is checked by the test
+    # suite, which runs as an ordinary user. The guard belongs here,
+    # immediately before the privileged action -- not at the top, where
+    # it would mask every argument error behind "run me through pkexec"
+    # and make the helper untestable without root.
+    #
+    # This is a usability check, not a security control. pkexec and the
+    # polkit action are what actually enforce authorisation.
+    if os.geteuid() != 0:
+        fail("this helper must be run through pkexec, not directly")
+
     dnf = "/usr/bin/dnf5" if Path("/usr/bin/dnf5").exists() else "/usr/bin/dnf"
     if not Path(dnf).exists():
         fail("dnf not found")
@@ -82,6 +93,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    if os.geteuid() != 0:
-        fail("this helper must be run through pkexec, not directly")
     sys.exit(main(sys.argv[1:]))

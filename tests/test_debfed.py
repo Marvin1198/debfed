@@ -2022,3 +2022,32 @@ def test_gui_escalates_only_for_the_install_step():
     build_at = install_source.index("_build(")
     escalate_at = install_source.index("_escalate_and_install(")
     assert build_at < escalate_at
+
+
+def test_helper_validates_arguments_before_checking_privilege(tmp: Path):
+    """The privilege guard belongs immediately before the privileged
+    action, not at the top.
+
+    Placed first it masks every argument error behind "run me through
+    pkexec" and makes the helper untestable without root -- which is how
+    the package build caught this, since rpmbuild runs %check as an
+    ordinary user.
+    """
+    proc = subprocess.run([sys.executable, str(HELPER_SRC), "relative.rpm"],
+                          capture_output=True, text=True)
+    assert "absolute" in proc.stderr
+    assert "pkexec" not in proc.stderr
+
+
+def test_helper_still_refuses_to_act_unprivileged(tmp: Path):
+    """A well-formed request from a non-root caller must still be refused."""
+    fake_rpm = tmp / "looks-real.rpm"
+    fake_rpm.write_bytes(b"\xed\xab\xee\xdb" + b"\x00" * 100)
+
+    if os.geteuid() == 0:
+        pytest.skip("cannot test the unprivileged path while running as root")
+
+    proc = subprocess.run([sys.executable, str(HELPER_SRC), str(fake_rpm)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 2
+    assert "pkexec" in proc.stderr

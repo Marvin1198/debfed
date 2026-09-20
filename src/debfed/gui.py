@@ -46,6 +46,66 @@ def _zenity() -> str:
     return path
 
 
+# The activation token the launcher minted for this process. It grants
+# focus to exactly one window on Wayland and is then stale, so it is
+# consumed by the first dialog and cleared. Reusing it would at best do
+# nothing and at worst confuse the compositor about which surface is
+# being activated.
+def _take_activation_token() -> dict[str, str]:
+    env = dict(os.environ)
+    for name in ("XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"):
+        os.environ.pop(name, None)
+    return env
+
+
+class _Progress:
+    """A pulsing progress dialog fed over stdin.
+
+    Conversion has two slow phases -- resolving every capability against
+    dnf, and building the rpm -- and a 166MB package spends about twenty
+    seconds in them. Without this the user gets an unexplained pause and
+    no way to tell the difference between working and hung.
+
+    Pulsating rather than percentage: neither phase reports meaningful
+    progress, and a fake percentage bar that jumps to 90 and waits is
+    worse than an honest indeterminate one.
+    """
+
+    def __init__(self, title: str, initial: str, env: dict[str, str] | None = None):
+        self._proc = subprocess.Popen(
+            [_zenity(), "--progress", "--pulsate", "--auto-close", "--no-cancel",
+             f"--title={title}", f"--text={initial}", "--width=420"],
+            stdin=subprocess.PIPE, text=True,
+            env=env if env is not None else None,
+        )
+
+    def step(self, message: str) -> None:
+        if self._proc.stdin is None or self._proc.poll() is not None:
+            return
+        try:
+            self._proc.stdin.write(f"# {message}\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+
+    def close(self) -> None:
+        if self._proc.stdin is not None:
+            try:
+                self._proc.stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+
+    def __enter__(self) -> _Progress:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
 def _notify(summary: str, body: str = "", urgency: str = "normal") -> None:
     notify = shutil.which("notify-send")
     if notify:
@@ -105,18 +165,28 @@ def install(deb: Path, *, verbose: bool = False) -> int:
         _error_dialog(f"No such file:\n{deb}")
         return 2
 
-    _notify("Inspecting package", deb.name)
+    # The first dialog gets the activation token, so it is the one that
+    # appears in front. That has to be the progress dialog: inspection
+    # runs before anything can be shown, and it is slow.
+    launch_env = _take_activation_token()
 
     with tempfile.TemporaryDirectory(prefix="debfed-gui-") as tmpdir:
         tmp = Path(tmpdir)
+        progress = _Progress(f"Inspecting {deb.name}",
+                             "Reading package…", env=launch_env)
         try:
+            progress.step("Resolving dependencies against Fedora…")
             analysis = analyse(deb, tmp)
         except (DebError, UnsafeInput, ValueError) as exc:
+            progress.close()
             _error_dialog(f"{deb.name} cannot be converted.\n\n{exc}")
             return 1
         except ResolveError as exc:
+            progress.close()
             _error_dialog(f"Could not check dependencies.\n\n{exc}")
             return 2
+        finally:
+            progress.close()
 
         # Capture the same report the terminal would print.
         import io
@@ -137,12 +207,17 @@ def install(deb: Path, *, verbose: bool = False) -> int:
         if not _confirm(f"Install {analysis.deb.name}?", report, "Convert"):
             return 1
 
-        _notify("Converting", f"{analysis.deb.name} {analysis.deb.version}")
+        build_progress = _Progress(f"Converting {analysis.deb.name}",
+                                   "Rewriting paths for Fedora…")
         try:
+            build_progress.step("Building the rpm…")
             _, _, result = _build(analysis, tmp, quiet=True)
         except (BuildError, BundleError, UnsafeInput) as exc:
+            build_progress.close()
             _error_dialog(f"Conversion failed.\n\n{exc}")
             return 1
+        finally:
+            build_progress.close()
 
         # The RPM lives in a temporary directory that disappears with this
         # block, so hand the helper a copy that outlives it.
@@ -171,6 +246,8 @@ def _escalate_and_install(rpm: Path, name: str) -> int:
         )
         return 2
 
+    # No progress dialog here: polkit shows its own, and a second window
+    # competing with the authentication prompt would be worse than none.
     proc = subprocess.run([PKEXEC, HELPER, str(rpm)],
                           capture_output=True, text=True)
 

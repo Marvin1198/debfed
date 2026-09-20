@@ -2007,9 +2007,18 @@ def test_gui_never_handles_a_password():
     from debfed import gui
 
     source = __import__("inspect").getsource(gui)
-    for forbidden in ("sudo -S", "getpass", "--password", "stdin=", "askpass"):
+    for forbidden in ("sudo -S", "getpass", "--password", "askpass",
+                      "--entry", "--hide-text"):
         assert forbidden not in source, forbidden
     assert "pkexec" in source
+
+    # stdin is piped, but only to feed progress messages to zenity --
+    # never to write a credential into another process.
+    escalate = __import__("inspect").getsource(gui._escalate_and_install)
+    assert "stdin" not in escalate
+    progress = __import__("inspect").getsource(gui._Progress)
+    assert "stdin=subprocess.PIPE" in progress
+    assert "# " in progress, "zenity progress messages are '# text' lines"
 
 
 def test_gui_escalates_only_for_the_install_step():
@@ -2051,3 +2060,69 @@ def test_helper_still_refuses_to_act_unprivileged(tmp: Path):
                           capture_output=True, text=True)
     assert proc.returncode == 2
     assert "pkexec" in proc.stderr
+
+
+# =====================================================================
+# Graphical feedback.
+#
+# Two problems reported from real use: the first dialog opened hidden
+# behind the file manager, and conversion ran for about twenty seconds
+# with no indication it was working.
+# =====================================================================
+
+
+def test_desktop_entry_requests_a_startup_token():
+    """On Wayland a window may take focus only if it presents an
+    xdg_activation_v1 token, and the launcher mints one for the child
+    process only when the entry asks for startup notification. Without
+    it the dialog degrades to a taskbar highlight the user must hunt
+    for."""
+    entry = _desktop_entry()
+    assert entry.get("StartupNotify", "").lower() == "true"
+
+
+def test_activation_token_is_consumed_exactly_once():
+    """The token grants focus to one window and is then stale."""
+    from debfed import gui
+
+    source = __import__("inspect").getsource(gui._take_activation_token)
+    assert "XDG_ACTIVATION_TOKEN" in source
+    assert "pop(" in source, "the token must be cleared after being taken"
+
+
+def test_both_slow_phases_show_progress():
+    """Inspection queries dnf for every capability and the build runs
+    rpmbuild; a 166MB package spends about twenty seconds between them."""
+    from debfed import gui
+
+    source = __import__("inspect").getsource(gui.install)
+    assert source.count("_Progress(") == 2, (
+        "each slow phase needs its own progress dialog"
+    )
+    # the first one gets the token, because it appears first
+    assert "env=launch_env" in source
+
+
+def test_progress_is_indeterminate_not_a_fake_percentage():
+    """Neither phase reports meaningful progress. A bar that jumps to 90
+    and waits is worse than an honest pulsing one."""
+    from debfed import gui
+
+    source = __import__("inspect").getsource(gui._Progress)
+    assert "--pulsate" in source
+
+
+def test_progress_closes_even_when_conversion_fails():
+    """A stuck progress dialog with no window behind it is worse than
+    the original problem."""
+    from debfed import gui
+
+    source = __import__("inspect").getsource(gui.install)
+    assert source.count("finally:") >= 2
+
+
+def test_no_progress_dialog_competes_with_the_polkit_prompt():
+    from debfed import gui
+
+    source = __import__("inspect").getsource(gui._escalate_and_install)
+    assert "_Progress(" not in source

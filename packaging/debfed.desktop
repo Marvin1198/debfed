@@ -32,6 +32,14 @@ MimeType=application/vnd.debian.binary-package;application/x-deb;application/x-d
 # debfed never handles a password. pkexec reports authorised or not.
 Terminal=false
 
+# Without this the first dialog opens unfocused and hidden behind the
+# file manager. On Wayland a window may only take focus if it presents an
+# xdg_activation_v1 token, and the launcher mints that token for the
+# child process only when the entry asks for startup notification. With
+# no token a genuine focus-steal is impossible and the window degrades to
+# an attention request -- a taskbar highlight the user has to hunt for.
+StartupNotify=true
+
 # A file handler, not something to launch on its own. Without this it
 # appears in the applications grid and does nothing useful when clicked.
 NoDisplay=true

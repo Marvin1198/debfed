@@ -2289,3 +2289,54 @@ def test_vendor_corpus_refuses_an_empty_sample():
     import corpus
 
     assert "fetch-vendor" in _inspect.getsource(corpus.cmd_vendor)
+
+
+def test_every_corpus_command_resolves_the_cli_first():
+    """Adding `vendor` without listing it alongside measure and run left
+    the invocation empty, so the first argument ran as the program:
+    FileNotFoundError: 'inspect'.
+
+    Checked structurally rather than by example, so the next subcommand
+    cannot repeat it.
+    """
+    import ast
+
+    source = (Path(__file__).parent / "corpus.py").read_text()
+    tree = ast.parse(source)
+
+    main = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    resolved: set[str] = set()
+    for node in ast.walk(main):
+        if isinstance(node, ast.Compare) and node.comparators:
+            target = node.comparators[0]
+            if isinstance(target, ast.Tuple):
+                resolved = {e.value for e in target.elts
+                            if isinstance(e, ast.Constant)}
+
+    needs: set[str] = set()
+    for fn in tree.body:
+        if isinstance(fn, ast.FunctionDef) and fn.name.startswith("cmd_"):
+            if any(isinstance(n, ast.Name) and n.id == "_debfed"
+                   for n in ast.walk(fn)):
+                needs.add(fn.name[len("cmd_"):].replace("_", "-"))
+
+    assert needs, "no command shells out to debfed?"
+    assert not needs - resolved, (
+        f"these run debfed without resolving it first: {sorted(needs - resolved)}"
+    )
+
+
+def test_unresolved_invocation_is_refused():
+    """The existing guard catches a CLI that fails. This catches one that
+    was never resolved at all."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    import corpus
+
+    saved = list(corpus._INVOCATION)
+    corpus._INVOCATION[:] = []
+    try:
+        with pytest.raises(corpus.CliUnavailable):
+            corpus._debfed("inspect", "x.deb")
+    finally:
+        corpus._INVOCATION[:] = saved

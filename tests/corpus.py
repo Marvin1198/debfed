@@ -142,6 +142,15 @@ def _debfed(*args: str, timeout: int = 600) -> subprocess.CompletedProcess:
     That looks like a result and is not, so a failed invocation aborts
     the whole run rather than being counted.
     """
+    if not _INVOCATION:
+        # Adding a subcommand without adding it to the resolver list left
+        # this empty, so the first argument was run as if it were the
+        # program. The guard below catches a CLI that fails; this catches
+        # one that was never resolved at all.
+        raise CliUnavailable(
+            "the debfed invocation was never resolved. A new subcommand "
+            "must be listed in main() alongside measure and run."
+        )
     proc = subprocess.run([*_INVOCATION, *args], capture_output=True,
                           text=True, timeout=timeout)
     if not ran_successfully(proc.returncode, proc.stdout + proc.stderr):
@@ -344,7 +353,7 @@ def main() -> int:
     m.set_defaults(func=cmd_measure)
     sub.add_parser("run").set_defaults(func=cmd_run)
     args = ap.parse_args()
-    if args.cmd in ("measure", "run"):
+    if args.cmd in ("measure", "run", "vendor"):
         try:
             _INVOCATION[:] = resolve_invocation()
         except CliUnavailable as exc:

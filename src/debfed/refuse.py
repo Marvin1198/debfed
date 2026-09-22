@@ -19,6 +19,7 @@ from .deb import Deb, parse_depends
 from .depsolve import Resolution
 from .layout import Relocation
 from .runtime import sandbox_outlook
+from .scripts import detect_bootstrapper
 
 
 class Verdict(StrEnum):
@@ -419,6 +420,24 @@ def assess(
                 "case, where upstream exports unversioned symbols and Debian "
                 "added CURL_OPENSSL_4. Bundling fixes it; the application would "
                 "very likely have run without.",
+            )
+        )
+
+    bootstrapper = detect_bootstrapper(reloc.payload_scripts)
+    if bootstrapper:
+        path, url = bootstrapper
+        findings.append(
+            Finding(
+                Severity.WARN, "DOWNLOADER",
+                f"{path} downloads the application instead of shipping it",
+                f"source: {url}\n"
+                "    The package contains a launcher, not the program. On "
+                "first run it fetches the real application into your home "
+                "directory and executes that.\n"
+                "    Consequences: rpm cannot verify what actually runs, "
+                "removing the package leaves the downloaded copy behind, and "
+                "the application updates itself without dnf. None of this is "
+                "caused by the conversion and none of it can be fixed here.",
             )
         )
 

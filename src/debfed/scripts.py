@@ -181,3 +181,48 @@ def analyse_scripts(
 
     # ldconfig is cheap and always correct for a package shipping libraries
     return plan
+
+
+
+# A launcher that downloads the real application at first run, rather
+# than shipping it. Discord is the archetype: /usr/bin/discord is a
+# shell script that fetches roughly 100MB into $XDG_CONFIG_HOME and
+# executes that, so the package holds a few megabytes of bootstrapper
+# and the application itself never passes through rpm at all.
+#
+# This matters to whoever installs it. rpm cannot verify the running
+# binary, removing the package leaves the downloaded copy behind in the
+# user's home directory, and the application updates itself without dnf
+# ever knowing. None of that is debfed's doing and none of it can be
+# fixed from here -- but it should not be a surprise.
+_DOWNLOAD_URL = re.compile(r'https?://[^\s"\';|)]+', re.IGNORECASE)
+_FETCHER = re.compile(r"\b(curl|wget|aria2c|fetch)\b")
+_USER_DIR = re.compile(r"\$(XDG_CONFIG_HOME|XDG_DATA_HOME|HOME)\b")
+
+# Launchers are small. Anything larger is a real program.
+_MAX_LAUNCHER_BYTES = 64 * 1024
+
+
+def detect_bootstrapper(files: dict[str, bytes]) -> tuple[str, str] | None:
+    """(path, url) when a shipped launcher downloads the application.
+
+    `files` maps installed paths to their contents. Only executable
+    scripts in launcher directories are considered: a URL inside
+    documentation or a sample configuration means nothing.
+    """
+    for path, blob in sorted(files.items()):
+        if not path.startswith(LAUNCHER_DIRS):
+            continue
+        if len(blob) > _MAX_LAUNCHER_BYTES or not blob.startswith(b"#!"):
+            continue
+        body = blob.decode("utf-8", "replace")
+        code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
+        match = _DOWNLOAD_URL.search(code)
+        if match is None:
+            continue
+        if not _FETCHER.search(code) and "DOWNLOAD" not in body:
+            continue
+        if not _USER_DIR.search(code):
+            continue
+        return path, match.group(0)
+    return None

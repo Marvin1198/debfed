@@ -2126,3 +2126,83 @@ def test_no_progress_dialog_competes_with_the_polkit_prompt():
 
     source = __import__("inspect").getsource(gui._escalate_and_install)
     assert "_Progress(" not in source
+
+
+# =====================================================================
+# AppArmor profiles and downloader launchers.
+#
+# Both found by converting Discord: the package shipped
+# /etc/apparmor.d/discord, which Fedora never loads, and /usr/bin/discord
+# turned out to be a bootstrapper that downloads the real application.
+# =====================================================================
+
+
+def test_apparmor_profiles_are_dropped(tmp: Path):
+    """AppArmor is Debian and Ubuntu's LSM; Fedora uses SELinux.
+
+    A profile shipped here is never loaded and never enforced, and gives
+    a false impression that the application is confined.
+    """
+    payload = tmp / "payload"
+    for f in ("etc/apparmor.d/app", "usr/share/apparmor/app.conf",
+              "usr/bin/app"):
+        p = payload / f
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+
+    reloc = layout.relocate(payload, tmp / "br")
+    assert reloc.files == ["/usr/bin/app"], reloc.files
+    assert "/etc/apparmor.d/app" in reloc.dropped
+
+
+DOWNLOADER = b"""#!/bin/sh
+DOWNLOAD=https://updates.example.com/
+config_home=$XDG_CONFIG_HOME
+if [ ! -x "$config_home/app/App" ]; then
+  curl -o "$config_home/app/App" $DOWNLOAD
+fi
+exec "$config_home/app/App"
+"""
+
+
+def test_downloader_launcher_is_detected():
+    from debfed.scripts import detect_bootstrapper
+
+    found = detect_bootstrapper({"/usr/bin/app": DOWNLOADER})
+    assert found == ("/usr/bin/app", "https://updates.example.com/")
+
+
+def test_ordinary_launcher_is_not_flagged():
+    from debfed.scripts import detect_bootstrapper
+
+    plain = b'#!/bin/sh\nexec /usr/share/app/bin/app "$@"\n'
+    assert detect_bootstrapper({"/usr/bin/app": plain}) is None
+
+
+def test_a_url_in_a_comment_is_not_a_downloader():
+    """A documentation link is not a download."""
+    from debfed.scripts import detect_bootstrapper
+
+    commented = (b"#!/bin/sh\n# see https://example.com/docs\n"
+                 b'exec /usr/share/app/app "$@"\n')
+    assert detect_bootstrapper({"/usr/bin/app": commented}) is None
+
+
+def test_downloader_outside_a_launcher_directory_is_ignored():
+    from debfed.scripts import detect_bootstrapper
+
+    assert detect_bootstrapper({"/usr/share/doc/app/example.sh": DOWNLOADER}) is None
+
+
+def test_downloader_produces_a_warning_not_a_refusal(tmp: Path):
+    """Shipping a bootstrapper is legitimate, just worth knowing about."""
+    deb = make_deb(tmp, "app", "1.0-1", {"usr/bin/app": DOWNLOADER})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    a = assess(d, reloc, Resolution())
+    assert a.verdict is not Verdict.REFUSE
+    warning = [f for f in a.warnings if f.code == "DOWNLOADER"]
+    assert warning, [f.code for f in a.findings]
+    assert "updates.example.com" in warning[0].detail
+    # the consequences must be spelled out, not just the fact
+    assert "rpm cannot verify" in warning[0].detail

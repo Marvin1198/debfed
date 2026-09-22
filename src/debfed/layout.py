@@ -108,6 +108,13 @@ DROP_PATTERNS: tuple[str, ...] = (
     "etc/apt/*",
     "usr/share/debconf/*",
     "usr/share/menu/*",
+    # AppArmor is Debian and Ubuntu's LSM; Fedora uses SELinux. A profile
+    # shipped here is never loaded, never enforced, and gives a false
+    # impression that the application is confined. The maintainer-script
+    # side of this is already stripped; the payload side was not.
+    "etc/apparmor.d/*",
+    "etc/apparmor/*",
+    "usr/share/apparmor/*",
     "DEBIAN/*",
 )
 
@@ -134,6 +141,29 @@ class Relocation:
     setuid: list[str] = field(default_factory=list)
     private_prefixes: list[str] = field(default_factory=list)
     absolute_links: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def payload_scripts(self) -> dict[str, bytes]:
+        """Small shipped scripts, by installed path.
+
+        Used to spot launchers that download the application rather than
+        containing it. Only small files are read: the point is to
+        inspect shell wrappers, not to slurp the payload.
+        """
+        out: dict[str, bytes] = {}
+        for installed in self.files:
+            on_disk = self.buildroot / installed.lstrip("/")
+            try:
+                if not on_disk.is_file() or on_disk.is_symlink():
+                    continue
+                if on_disk.stat().st_size > 64 * 1024:
+                    continue
+                blob = on_disk.read_bytes()
+            except OSError:
+                continue
+            if blob.startswith(b"#!"):
+                out[installed] = blob
+        return out
 
     @property
     def ownable_dirs(self) -> list[str]:

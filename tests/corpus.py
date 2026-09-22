@@ -35,9 +35,38 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _cli import CliUnavailable, ran_successfully, resolve_invocation  # noqa: E402
 
 BASE = "http://archive.ubuntu.com/ubuntu/pool"
+
+# Vendor applications, the population debfed actually targets.
+#
+# The archive sample below is a stress test: distribution packages
+# depend on other distribution packages, so a quarter of them name a
+# library Fedora does not carry and are correctly refused. Vendor
+# applications bundle their own libraries, which is why they convert at
+# a far higher rate -- and why the archive figure understates the tool
+# for its real use.
+#
+# This sample found a bug within an hour that 54 archive packages never
+# could: Obsidian quotes the paths in its maintainer script, VS Code
+# does not, and launcher extraction silently handled only one of them.
+#
+# URLs are stable "latest" endpoints where the vendor publishes one, and
+# a pinned release otherwise. Packages that 404 are skipped rather than
+# failing the run: vendors move things.
+VENDOR = {
+    "google-chrome":
+        "https://dl.google.com/linux/direct/"
+        "google-chrome-stable_current_amd64.deb",
+    "obsidian":
+        "https://github.com/obsidianmd/obsidian-releases/releases/download/"
+        "v1.7.7/obsidian_1.7.7_amd64.deb",
+    "vscodium":
+        "https://github.com/VSCodium/vscodium/releases/download/"
+        "1.96.2.24355/codium_1.96.2.24355_amd64.deb",
+}
 HERE = pathlib.Path(__file__).resolve().parent
 DEBS = HERE / "debs"
 RPMS = HERE / "rpms"
+VENDOR_DEBS = HERE / "vendor"
 
 # Deliberately diverse: GUI apps, CLI tools, daemons, fonts, games,
 # browsers, libraries, and a few packages that MUST be refused.
@@ -72,6 +101,26 @@ def fetch_one(pkg: str) -> str:
         except Exception as exc:
             return f"FAIL {pkg}: {exc}"
     return f"MISS {pkg}"
+
+
+def cmd_fetch_vendor(_args) -> int:
+    """Download vendor applications, the population debfed targets."""
+    VENDOR_DEBS.mkdir(parents=True, exist_ok=True)
+    for name, url in sorted(VENDOR.items()):
+        dest = VENDOR_DEBS / f"{name}.deb"
+        if dest.exists():
+            print(f"  have {name}")
+            continue
+        try:
+            urllib.request.urlretrieve(url, dest)
+            print(f"  ok   {name} ({dest.stat().st_size // (1024 * 1024)}MB)")
+        except Exception as exc:
+            # Vendors move things. A missing package is not a test failure.
+            dest.unlink(missing_ok=True)
+            print(f"  MISS {name}: {exc}")
+    have = len(list(VENDOR_DEBS.glob("*.deb")))
+    print(f"\nvendor corpus: {have} packages")
+    return 0 if have else 2
 
 
 def cmd_fetch(_args) -> int:
@@ -220,11 +269,75 @@ def cmd_run(_args) -> int:
     return 0
 
 
+def cmd_vendor(_args) -> int:
+    """Convert every vendor application and check the result installs.
+
+    Stricter than `measure`: a vendor application that does not convert
+    is a failure, not a statistic. These are the packages debfed exists
+    to handle.
+    """
+    debs = sorted(VENDOR_DEBS.glob("*.deb"))
+    if not debs:
+        print(f"no packages in {VENDOR_DEBS}. Run:  "
+              "python3 tests/corpus.py fetch-vendor", file=sys.stderr)
+        return 2
+
+    RPMS.mkdir(parents=True, exist_ok=True)
+    failures = 0
+    for deb in debs:
+        print(f"  {deb.stem:<24}", end=" ")
+        inspect = _debfed("inspect", "--json", str(deb))
+        try:
+            verdict = json.loads(inspect.stdout)[0]["verdict"]
+        except Exception:
+            print("inspect produced no verdict")
+            failures += 1
+            continue
+        if verdict != "A":
+            print(f"verdict {verdict} (expected A)")
+            failures += 1
+            continue
+
+        build = _debfed("build", "-o", str(RPMS), str(deb))
+        if build.returncode != 0:
+            print("build failed")
+            failures += 1
+            continue
+
+        rpms = sorted(RPMS.glob(f"{deb.stem}*.rpm")) or sorted(
+            RPMS.glob("*.rpm"), key=lambda p: p.stat().st_mtime)[-1:]
+        if not rpms:
+            print("no rpm produced")
+            failures += 1
+            continue
+        rpm = rpms[-1]
+
+        # The property that makes converted packages installable at all.
+        listing = subprocess.run(["rpm", "-qpl", str(rpm)],
+                                 capture_output=True, text=True)
+        shared = [line for line in listing.stdout.splitlines()
+                  if line.strip() in ("/usr", "/usr/bin", "/usr/share",
+                                      "/usr/lib", "/usr/lib64", "/etc",
+                                      "/opt")]
+        if shared:
+            print(f"claims shared directories: {shared[:3]}")
+            failures += 1
+            continue
+        print("converts, builds, owns only its own tree")
+
+    print(f"\n{len(debs) - failures}/{len(debs)} vendor applications converted")
+    return 1 if failures else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("fetch").set_defaults(func=cmd_fetch)
+    sub.add_parser("fetch-vendor").set_defaults(func=cmd_fetch_vendor)
+    v = sub.add_parser("vendor",
+                       help="measure the vendor applications debfed targets")
+    v.set_defaults(func=cmd_vendor)
     m = sub.add_parser("measure")
     m.add_argument("--offline", action="store_true",
                    help="skip dnf resolution (structure only)")

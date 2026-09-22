@@ -507,6 +507,16 @@ jobs:
       - name: Install and execute every converted package
         run: python3 tests/corpus.py run | tee runtest.log
 
+      # Vendor applications are the population debfed targets, and they
+      # are held to a stricter standard than the archive sample: one that
+      # fails to convert is a failure, not a statistic. This sample found
+      # a launcher-extraction bug within an hour that 54 archive packages
+      # never could.
+      - name: Convert vendor applications
+        run: |
+          python3 tests/corpus.py fetch-vendor
+          python3 tests/corpus.py vendor | tee vendor.log
+
       - name: Gate on crashes and build failures
         run: |
           # A crash is always a bug. Refusals are not.

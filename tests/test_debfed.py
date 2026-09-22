@@ -2253,3 +2253,39 @@ def test_quoted_alternatives_slot_is_still_skipped():
     body = ("#!/bin/sh\nupdate-alternatives --install '/usr/bin/editor' "
             "'editor' '/opt/App/app' 100\n")
     assert extract_symlinks({"postinst": body}, "app") == []
+
+
+def test_vendor_corpus_treats_a_failed_conversion_as_an_error():
+    """The archive sample is a stress test and reports a distribution.
+    Vendor applications are the population debfed targets, so a failure
+    there is a failure, not a statistic."""
+    import inspect as _inspect
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import corpus
+
+    source = _inspect.getsource(corpus.cmd_vendor)
+    assert 'verdict != "A"' in source
+    assert "failures += 1" in source
+    assert "return 1 if failures else 0" in source
+
+
+def test_vendor_corpus_checks_directory_ownership():
+    """Claiming a shared directory is what makes alien output
+    uninstallable; it must be asserted, not assumed."""
+    import inspect as _inspect
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import corpus
+
+    source = _inspect.getsource(corpus.cmd_vendor)
+    assert "claims shared directories" in source
+
+
+def test_vendor_corpus_refuses_an_empty_sample():
+    import inspect as _inspect
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import corpus
+
+    assert "fetch-vendor" in _inspect.getsource(corpus.cmd_vendor)

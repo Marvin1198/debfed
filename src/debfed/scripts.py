@@ -84,13 +84,23 @@ class ScriptPlan:
 #
 # rpm's equivalent is simply to ship the symlink in %files, where it is
 # owned and removed with the package.
+# Paths in maintainer scripts are frequently quoted, and just as
+# frequently not. Obsidian writes
+#     update-alternatives --install '/usr/bin/obsidian' ...
+# while VS Code writes the same thing bare. A pattern anchored on a
+# leading slash silently matches one and not the other, so the launcher
+# was restored for some packages and quietly missing for others.
+_Q = r"['\"]?"
+_PATH = r"/[^\s;|&'\"]+"
+
 _LN_RE = re.compile(
-    r"^\s*ln\s+(?:-[a-zA-Z]+\s+)*(?P<target>/[^\s;|&]+)\s+(?P<link>/[^\s;|&]+)",
+    rf"^\s*ln\s+(?:-[a-zA-Z]+\s+)*{_Q}(?P<target>{_PATH}){_Q}\s+"
+    rf"{_Q}(?P<link>{_PATH}){_Q}",
     re.MULTILINE,
 )
 _ALTERNATIVES_RE = re.compile(
-    r"update-alternatives\s+--install\s+(?P<link>/[^\s]+)\s+\S+\s+"
-    r"(?P<target>/[^\s]+)",
+    rf"update-alternatives\s+--install\s+{_Q}(?P<link>{_PATH}){_Q}\s+"
+    rf"{_Q}\S+?{_Q}\s+{_Q}(?P<target>{_PATH}){_Q}",
     re.MULTILINE,
 )
 

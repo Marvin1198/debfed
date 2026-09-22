@@ -2206,3 +2206,50 @@ def test_downloader_produces_a_warning_not_a_refusal(tmp: Path):
     assert "updates.example.com" in warning[0].detail
     # the consequences must be spelled out, not just the fact
     assert "rpm cannot verify" in warning[0].detail
+
+
+OBSIDIAN_POSTINST = """#!/bin/bash
+if type update-alternatives 2>/dev/null >&1; then
+    if [ -L '/usr/bin/obsidian' -a -e '/usr/bin/obsidian' ]; then
+        rm -f '/usr/bin/obsidian'
+    fi
+    update-alternatives --install '/usr/bin/obsidian' 'obsidian' \
+'/opt/Obsidian/obsidian' 100 || ln -sf '/opt/Obsidian/obsidian' '/usr/bin/obsidian'
+else
+    ln -sf '/opt/Obsidian/obsidian' '/usr/bin/obsidian'
+fi
+"""
+
+
+def test_quoted_launcher_paths_are_extracted():
+    """Paths in maintainer scripts are quoted about as often as not.
+
+    Obsidian quotes them, VS Code does not. A pattern anchored on a
+    leading slash matched one and silently missed the other, so the
+    launcher was restored for some packages and absent for others --
+    Obsidian installed correctly and then was not on PATH.
+    """
+    from debfed.scripts import extract_symlinks
+
+    links = extract_symlinks({"postinst": OBSIDIAN_POSTINST}, "obsidian")
+    assert links == [("/usr/bin/obsidian", "/opt/Obsidian/obsidian")]
+
+
+def test_both_quoting_styles_work():
+    from debfed.scripts import extract_symlinks
+
+    bare = "#!/bin/sh\nln -s /opt/App/app /usr/bin/app\n"
+    single = "#!/bin/sh\nln -s '/opt/App/app' '/usr/bin/app'\n"
+    double = '#!/bin/sh\nln -s "/opt/App/app" "/usr/bin/app"\n'
+    expected = [("/usr/bin/app", "/opt/App/app")]
+    for body in (bare, single, double):
+        assert extract_symlinks({"postinst": body}, "app") == expected, body
+
+
+def test_quoted_alternatives_slot_is_still_skipped():
+    """Quoting must not smuggle a shared name past the basename check."""
+    from debfed.scripts import extract_symlinks
+
+    body = ("#!/bin/sh\nupdate-alternatives --install '/usr/bin/editor' "
+            "'editor' '/opt/App/app' 100\n")
+    assert extract_symlinks({"postinst": body}, "app") == []

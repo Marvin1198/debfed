@@ -593,18 +593,36 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
+      # git must exist BEFORE checkout. Without it actions/checkout falls
+      # back to downloading a tarball through the REST API: the files
+      # arrive but there is no .git directory, and the first command that
+      # needs the repository fails with "not a git repository". The other
+      # jobs never notice because they only read files.
+      - name: Install git before checkout
+        run: dnf install -y --setopt=install_weak_deps=False git tar
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Confirm a real repository was checked out
+        run: |
+          if [ ! -d .git ]; then
+            echo "::error::checkout produced no .git directory, so this is a"
+            echo "::error::REST-API tarball rather than a repository"
+            exit 1
+          fi
+          git config --global --add safe.directory "$PWD"
+          echo "checked out $(git rev-parse --short HEAD)"
+
       - name: Install packaging tools
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             rpm-build rpmdevtools rpmlint python3-devel python3-setuptools \
             python3-pip python3-pytest python3-pyyaml pyproject-rpm-macros \
-            git tar zstd
+            zstd
 
       - name: Determine version
         id: ver

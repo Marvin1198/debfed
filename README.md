@@ -32,25 +32,47 @@ Fedora, RPM Fusion or a COPR, use that. Those builds are compiled
 against Fedora's libraries and receive security updates through dnf. A
 converted package receives whatever the vendor pushes.
 
-**It will refuse things, and that is the tool working.** Roughly a
-quarter of packages cannot be converted correctly. debfed names the
-library or property that makes it impossible rather than producing
-something that installs and then fails.
+**It refuses things it cannot convert correctly, and that is the tool
+working.** It names the library or property that makes conversion
+impossible rather than producing something that installs and then fails.
 
 ---
 
 ## Measured results
 
-A corpus of 54 real packages — GUI applications, command-line tools,
-daemons, fonts, games, browsers, libraries — resolved against live
-Fedora 44 repositories:
+### Vendor applications — what this tool is for
+
+Resolved against live Fedora 44 repositories:
+
+| Application | Verdict | |
+|---|---|---|
+| Google Chrome | A | converts, builds, installs |
+| Claude Desktop | A | converts, builds, installs |
+| Discord | A | converts, builds, installs |
+| Obsidian | A | converts, builds, installs |
+| VSCodium | A | converts, builds, installs |
+
+**5 of 5**, no refusals, and none claims a directory owned by another
+package. Chrome was installed, run, and removed together with the
+thirteen dependencies dnf pulled in for it.
+
+```bash
+python3 tests/corpus.py fetch-vendor
+python3 tests/corpus.py vendor
+```
+
+This is held to a stricter standard than the sample below: a vendor
+application that fails to convert is a failure, not a statistic.
+
+### Distribution packages — a deliberate stress test
+
+A sample of 54 Ubuntu archive packages: GUI applications, command-line
+tools, daemons, fonts, games, browsers, libraries.
 
 | Outcome | Count | |
 |---|---|---|
 | Converts | 40 | 74% |
 | Refused | 14 | 26% |
-
-The refusals, by cause:
 
 | Cause | Count | Why |
 |---|---|---|
@@ -60,7 +82,12 @@ The refusals, by cause:
 | `GLIBC_SKEW` | 1 | needs a newer glibc than the host has |
 | `SYSTEM_PATH` | 1 | writes into a boot or kernel path |
 
-Run the corpus yourself:
+The two populations differ for a structural reason. Distribution
+packages depend on *other distribution packages*, so a quarter of them
+name a library Fedora does not carry and are correctly refused. Vendor
+applications bundle their own libraries, which is why they convert at a
+far higher rate. **The 74% figure understates the tool for its actual
+use**; it is kept because a hard sample finds bugs an easy one does not.
 
 ```bash
 python3 tests/corpus.py fetch
@@ -95,9 +122,15 @@ Two strategies, chosen per package:
 
 - **A — translate to RPM.** Every requirement resolves against Fedora.
 - **B — private prefix.** A library the host lacks is bundled under
-  `/opt/debfed/<app>/lib`, and the binaries are re-pointed at it with
+  `/opt/debfed/<app>/lib` and the binaries are re-pointed at it with
   `patchelf --force-rpath`. Only possible when the package ships that
   library itself.
+
+**Strategy B has not been needed by any package tested so far** — 0 of
+59. Vendor applications keep their private libraries under `/opt` or
+`/usr/share`, where provides-filtering already keeps them internal, and
+distribution packages want libraries that live in other packages, which
+a private prefix cannot supply. Treat it as the less-exercised path.
 
 ---
 
@@ -136,7 +169,7 @@ symbol label. Debian adds its own symbol versions to some libraries
 whose ABI is unchanged; `libcurl` is the known case, where upstream
 exports unversioned symbols and Debian added `CURL_OPENSSL_4`. When the
 provider defines no symbol versions at all, the dynamic linker warns and
-continues, so these are not real incompatibilities. 13 of 54 corpus
+continues, so these are not real incompatibilities. 13 of 54 sample
 packages carry one.
 
 **`SANDBOX`** — the package ships a setuid `chrome-sandbox` helper and
@@ -179,17 +212,35 @@ installable.
 
 ## Installing
 
+From the latest release:
+
 ```bash
-sudo dnf install rpm-build patchelf zenity
+sudo dnf install \
+  https://github.com/Marvin1198/debfed/releases/download/v0.1.0/debfed-0.1.0-1.fc44.noarch.rpm
+```
+
+Each release ships a `SHA256SUMS` alongside the package.
+
+Install as an RPM rather than with pip or pipx if you want the
+file-manager integration: the privileged helper and its polkit action
+are part of the package and are not installed any other way.
+
+### From source
+
+```bash
+sudo dnf install -y \
+  git make rpm-build rpmdevtools pyproject-rpm-macros desktop-file-utils \
+  python3-devel python3-setuptools python3-pytest python3-pyyaml \
+  patchelf zenity
+
 git clone https://github.com/Marvin1198/debfed
 cd debfed
 make rpm
 sudo dnf install ~/rpmbuild/RPMS/noarch/debfed-*.rpm
 ```
 
-Install as an RPM rather than with pip or pipx if you want the
-file-manager integration: the privileged helper and its polkit action
-are part of the package.
+The build runs the full test suite in `%check`, so it fails rather than
+producing a package that does not work.
 
 ---
 
@@ -201,11 +252,12 @@ debfed inspect -v app.deb       # adds the host runtime report
 debfed build   app.deb -o DIR   # produce an RPM, install nothing
 debfed install app.deb          # convert, show the transaction, install
 debfed remove  <name>           # dnf remove
-debfed map     list|get|add     # dependency mapping database
+debfed map     list|get|add|remove   # dependency mapping database
 ```
 
 `--strict-scripts` refuses any package whose maintainer scripts ask a
-debconf question, instead of warning.
+debconf question, instead of warning. It works before or after the
+subcommand.
 
 Exit codes: `0` success, `1` a verdict about the package (refused, or
 you declined), `2` debfed could not decide (a tool is missing, the file
@@ -230,6 +282,11 @@ the tool and is not traded away for convenience.
 reports nothing back but whether authorisation succeeded. An application
 that collects the password itself is indistinguishable from a phishing
 dialog, whatever its title bar says.
+
+Conversion takes about twenty seconds for a large Electron application,
+and a progress dialog is shown throughout. A package that downloads
+itself on first run — see `DOWNLOADER` above — may then spend several
+more minutes fetching, which debfed neither controls nor reports.
 
 ---
 

@@ -1,5 +1,5 @@
 %global pypi_name debfed
-%global forgeurl https://github.com/USER/debfed
+%global forgeurl https://github.com/Marvin1198/debfed
 
 Name:           debfed
 Version:        0.1.0

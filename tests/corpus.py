@@ -77,7 +77,7 @@ cowsay figlet lolcat dosbox xarchiver gnome-mines memcached
 ca-certificates desktop-file-utils shared-mime-info gedit gnome-calculator
 vlc audacity inkscape geany meld filezilla keepassxc thunderbird
 openssh-server cups network-manager bluez dbus sudo bash coreutils
-systemd""".split()
+systemd base-files""".split()
 
 
 def fetch_one(pkg: str) -> str:

@@ -61,7 +61,18 @@ BASE_PACKAGES = frozenset(
         "grub-common", "grub-pc", "grub-efi-amd64", "shim-signed",
         "gdm3", "sddm", "lightdm", "xserver-xorg-core",
         "linux-image-generic", "linux-headers-generic",
+        "base-files", "base-passwd", "usrmerge", "usr-is-merged",
+        "init", "init-system-helpers", "sysvinit-utils", "debianutils",
+        "debconf", "adduser", "libpam-modules", "libpam-runtime",
+        "ncurses-base", "ncurses-bin", "procps", "kmod", "findutils",
+        "diffutils", "hostname", "mawk",
     }
+)
+
+# Name families that are always kernel, boot or driver packages.
+BASE_PACKAGE_PREFIXES = (
+    "linux-image-", "linux-headers-", "linux-modules-", "linux-firmware",
+    "systemd-", "libc6-", "nvidia-kernel-", "nvidia-driver",
 )
 
 # Paths that belong to the boot chain or the kernel. Installing a Debian
@@ -212,25 +223,37 @@ class Assessment:
         return self.verdict is not Verdict.REFUSE
 
 
-def assess(
-    deb: Deb,
-    reloc: Relocation,
-    res: Resolution,
-    *,
-    allow_private_prefix: bool = True,
-    strict_scripts: bool = False,
-) -> Assessment:
-    """Decide whether and how this package can be installed."""
-    findings: list[Finding] = []
+def identity_findings(deb: Deb) -> list[Finding]:
+    """Refusals decided from the control file alone.
 
-    # ---- identity refusals -------------------------------------------
-    if deb.name in BASE_PACKAGES:
+    These run before the payload is relocated, so a base package is
+    refused by name and never reaches the code that rewrites its paths.
+    """
+    findings: list[Finding] = []
+    if deb.name in BASE_PACKAGES or deb.name.startswith(BASE_PACKAGE_PREFIXES):
         findings.append(
             Finding(
                 Severity.FATAL, "BASE_PACKAGE",
                 f"{deb.name} is a base system package",
                 "Installing a Debian build over Fedora's copy is unrecoverable. "
                 "This is out of scope by design.",
+            )
+        )
+    elif deb.fields.get("Essential", "").strip().lower() == "yes":
+        findings.append(
+            Finding(
+                Severity.FATAL, "BASE_PACKAGE",
+                f"{deb.name} is marked Essential",
+                "Debian marks packages the system cannot run without as "
+                "Essential. Fedora has its own copy of that layer.",
+            )
+        )
+    elif deb.fields.get("Priority", "").strip().lower() == "required":
+        findings.append(
+            Finding(
+                Severity.FATAL, "BASE_PACKAGE",
+                f"{deb.name} has Priority: required",
+                "Required-priority packages make up the Debian base system.",
             )
         )
 
@@ -243,6 +266,28 @@ def assess(
                 "debfed v1 targets x86_64 only.",
             )
         )
+    return findings
+
+
+def early_assessment(deb: Deb) -> Assessment | None:
+    """A refusal reached before relocation, or None to continue."""
+    findings = identity_findings(deb)
+    fatal = [f for f in findings if f.severity is Severity.FATAL]
+    if not fatal:
+        return None
+    return Assessment(Verdict.REFUSE, findings, fatal[0].message)
+
+
+def assess(
+    deb: Deb,
+    reloc: Relocation,
+    res: Resolution,
+    *,
+    allow_private_prefix: bool = True,
+    strict_scripts: bool = False,
+) -> Assessment:
+    """Decide whether and how this package can be installed."""
+    findings: list[Finding] = identity_findings(deb)
 
     # Pre-Depends encodes dpkg unpack ordering. For a leaf application it
     # is almost always a formality -- dpkg, libc6, multiarch-support,

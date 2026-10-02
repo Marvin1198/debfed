@@ -700,6 +700,13 @@ jobs:
             Install:
 
             ```bash
+            sudo dnf copr enable marvin1198/debfed
+            sudo dnf install debfed
+            ```
+
+            Or this release's RPM directly:
+
+            ```bash
             sudo dnf install https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/debfed-${{ needs.build.outputs.version }}-1.fc44.noarch.rpm
             ```
 
@@ -709,3 +716,35 @@ jobs:
             audit, secret scan, the full test suite on two Fedora releases,
             the live exploit suite, and package-integrity checks before
             publishing. See SECURITY.md.
+
+  # ------------------------------------------------------------------
+  # 12. Tag only: rebuild in COPR from the tagged spec.
+  #
+  # Lives here, not in copr.yml's `release: published` trigger: a release
+  # created with GITHUB_TOKEN does not start other workflows, so that
+  # trigger never fired for tagged releases.
+  # ------------------------------------------------------------------
+  copr:
+    name: submit to copr
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: dnf install -y --setopt=install_weak_deps=False copr-cli
+      - name: Configure copr credentials
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          if [ -z "$COPR_CONFIG" ]; then
+            echo "::error::COPR_CONFIG secret is not set; submit the build by hand"
+            exit 1
+          fi
+          mkdir -p ~/.config
+          printf '%s' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+      - name: Submit build
+        run: copr-cli build debfed packaging/debfed.spec

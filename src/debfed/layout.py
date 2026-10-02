@@ -31,6 +31,9 @@ REWRITES: tuple[tuple[str, str], ...] = (
     ("lib", "usr/lib"),
 )
 
+# Top-level merged-/usr links. Fedora's `filesystem` package owns these.
+USRMERGE_LINKS = frozenset({"bin", "sbin", "lib", "lib32", "lib64", "libx32"})
+
 # Directories owned by Fedora's `filesystem` package (and friends). A
 # generated RPM must never claim these as %dir -- that is exactly the
 # failure mode that makes `alien` output uninstallable.
@@ -243,6 +246,15 @@ def relocate(payload: Path, buildroot: Path) -> Relocation:
 
         target = buildroot / new_rel
 
+        # Merged-/usr compatibility links (/bin -> usr/bin and friends).
+        # Debian ships them in base-files; on Fedora they belong to the
+        # `filesystem` package. Translating /bin to /usr/bin turns the link
+        # into a dangling /usr/bin -> usr/bin, which then blocks the real
+        # /usr/bin directory and crashed relocation.
+        if src.is_symlink() and rel in USRMERGE_LINKS:
+            result.dropped.append("/" + rel)
+            continue
+
         if src.is_symlink():
             target.parent.mkdir(parents=True, exist_ok=True)
             _assert_inside(buildroot, target)
@@ -254,6 +266,11 @@ def relocate(payload: Path, buildroot: Path) -> Relocation:
                 if translated != link:
                     link = translated
                 result.absolute_links["/" + new_rel] = link
+            if target.is_dir() and not target.is_symlink():
+                raise ValueError(
+                    f"payload path conflict: link /{rel} maps to /{new_rel}, "
+                    "which the package already ships as a directory"
+                )
             if target.is_symlink() or target.exists():
                 target.unlink()
             # A link that resolves to itself makes rpm fail to stat the
@@ -272,6 +289,11 @@ def relocate(payload: Path, buildroot: Path) -> Relocation:
             continue
 
         if src.is_dir():
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise ValueError(
+                    f"payload path conflict: /{rel} maps to /{new_rel}, "
+                    "which the package already ships as a link or file"
+                )
             target.mkdir(parents=True, exist_ok=True)
             _assert_inside(buildroot, target)
             shutil.copystat(src, target)

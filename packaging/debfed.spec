@@ -2,7 +2,7 @@
 %global forgeurl https://github.com/Marvin1198/debfed
 
 Name:           debfed
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Install Debian-targeted applications on Fedora as native RPMs
 
@@ -103,6 +103,15 @@ update-desktop-database &>/dev/null || :
 %{_mandir}/man1/debfed.1*
 
 %changelog
+* Fri Oct 02 2026 Marvin Patel <marvinpatel42@gmail.com> - 0.1.1-1
+- Refuse base, Essential and Priority: required packages from control data,
+  before relocation (base-files crashed instead of being refused)
+- Drop top-level merged-/usr links (/bin, /lib, ...) from payloads
+- Mark converted packages: Release .debfed, Vendor, Provides debfed-converted
+- Warn when Fedora already packages the same name
+- Count always-satisfied capabilities as satisfied in inspect
+- Hide dnf's "Operation aborted" line in the dry run
+
 * Mon Sep 14 2026 debfed maintainers <debfed@example.com> - 0.1.0-1
 - Initial package
 - inspect, build, install, remove and map subcommands

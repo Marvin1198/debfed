@@ -2340,3 +2340,110 @@ def test_unresolved_invocation_is_refused():
             corpus._debfed("inspect", "x.deb")
     finally:
         corpus._INVOCATION[:] = saved
+
+
+# ------------------------------------------------- v0.1.1 regressions
+
+
+def test_relocate_drops_usrmerge_links(tmp: Path):
+    """base-files ships /bin -> usr/bin. Translating it used to leave a
+    dangling /usr/bin link that crashed relocation of the real /usr/bin."""
+    payload = tmp / "payload"
+    (payload / "usr/bin").mkdir(parents=True)
+    (payload / "usr/bin/tool").write_bytes(b"x")
+    for name in ("bin", "sbin", "lib", "lib64"):
+        os.symlink(f"usr/{name}", payload / name)
+
+    reloc = layout.relocate(payload, tmp / "buildroot")
+    assert "/usr/bin/tool" in reloc.files
+    for name in ("bin", "sbin", "lib", "lib64"):
+        assert f"/{name}" in reloc.dropped
+    assert (tmp / "buildroot/usr/bin").is_dir()
+    assert not (tmp / "buildroot/usr/bin").is_symlink()
+
+
+def test_relocate_link_and_dir_collision_is_a_clean_error(tmp: Path):
+    payload = tmp / "payload"
+    (payload / "usr").mkdir(parents=True)
+    os.symlink("elsewhere", payload / "usr/lib64")
+    (payload / "lib64").mkdir()
+    (payload / "lib64/x").write_bytes(b"x")
+    with pytest.raises(ValueError, match="payload path conflict"):
+        layout.relocate(payload, tmp / "buildroot")
+
+
+@pytest.mark.parametrize("name,extra", [
+    ("base-files", ""),
+    ("linux-image-6.1.0-13-amd64", ""),
+    ("somepkg", "Essential: yes\n"),
+    ("otherpkg", "Priority: required\n"),
+])
+def test_base_packages_refused_before_relocation(tmp: Path, name, extra):
+    from debfed.cli import analyse
+
+    deb = make_deb(tmp, name, "1.0-1", {"usr/bin/x": b"x"}, control_extra=extra)
+    an = analyse(deb, tmp / "w")
+    assert an.early
+    assert an.assessment.verdict is Verdict.REFUSE
+    assert any(f.code == "BASE_PACKAGE" for f in an.assessment.fatal)
+    # Nothing was relocated, so nothing could have been built.
+    assert not (tmp / "w/buildroot").exists()
+
+
+def test_early_refusal_prints_and_exits_1(tmp: Path, capsys):
+    from debfed.cli import main
+
+    deb = make_deb(tmp, "base-files", "13.8", {"etc/issue": b"x"},
+                   control_extra="Essential: yes\nPriority: required\n")
+    assert main(["inspect", str(deb)]) == 1
+    assert main(["install", "-y", str(deb)]) == 1
+    out = capsys.readouterr().out
+    assert "REFUSED" in out
+    assert "built" not in out
+
+
+def test_application_is_not_refused_by_identity(tmp: Path):
+    from debfed.refuse import early_assessment
+
+    deb = make_deb(tmp, "obsidian", "1.7.7", {"opt/Obsidian/obsidian": b"x"},
+                   control_extra="Priority: optional\n")
+    assert early_assessment(unpack(deb, tmp / "w")) is None
+
+
+def test_spec_marks_release_and_vendor(tmp: Path):
+    deb = make_deb(tmp, "ripgrep", "15.2.0-1", {"usr/bin/rg": b"x"})
+    d = unpack(deb, tmp / "w")
+    reloc = layout.relocate(d.payload_dir, tmp / "br")
+    plan = spec.plan_spec(d, reloc, analyse_scripts({}, [], SAFE_TRIGGERS), "A")
+    text = spec.render(plan, reloc.buildroot)
+    assert "Release:        1.debfed%{?dist}" in text
+    assert "Vendor:         debfed" in text
+    assert "Provides:       debfed-converted" in text
+
+
+def test_always_satisfied_capabilities_are_counted(tmp: Path, monkeypatch):
+    from debfed import depsolve
+
+    monkeypatch.setattr(depsolve, "scan_requires", lambda _b: ["rtld(GNU_HASH)"])
+    monkeypatch.setattr(depsolve, "scan_provides", lambda _b: [])
+    monkeypatch.setattr(depsolve, "foreign_objects", lambda: {})
+    monkeypatch.setattr(depsolve, "_repoquery", lambda _c: [])
+    res = depsolve.resolve(tmp)
+    assert res.satisfied == {"rtld(GNU_HASH)": ["glibc"]}
+    assert res.unsatisfied == []
+
+
+def test_dry_run_hides_assumeno_noise(monkeypatch, capsys):
+    from debfed import build
+
+    class P:
+        returncode = 1
+        stdout = "Installing:\n ripgrep\nOperation aborted by the user.\n"
+
+    monkeypatch.setattr(build, "_require", lambda name, _pkg: name)
+    monkeypatch.setattr(build.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(build.subprocess, "run", lambda *a, **k: P())
+    build.dnf_install(Path("x.rpm"), assume_yes=False, test=True)
+    out = capsys.readouterr().out
+    assert "ripgrep" in out
+    assert "aborted" not in out

@@ -39,6 +39,10 @@ from .scripts import ScriptPlan
 
 VENDOR_PREFIX = "/opt/debfed"
 
+# Appended to every converted package's Release, before %{?dist}.
+RELEASE_MARKER = ".debfed"
+VENDOR_TAG = "debfed (converted from a Debian package)"
+
 # Debian epoch:upstream-revision -> rpm Epoch/Version/Release
 _VERSION_RE = re.compile(
     r"^(?:(?P<epoch>\d+):)?(?P<upstream>[^-]+)(?:-(?P<revision>.+))?$"
@@ -295,13 +299,21 @@ def render(plan: SpecPlan, payload_dir: Path) -> str:
     if epoch:
         add(f"Epoch:          {epoch}")
     add(f"Version:        {version}")
-    add(f"Release:        {release}%{{?dist}}")
+    # The ".debfed" marker keeps a converted package distinguishable from a
+    # Fedora build of the same name and version. Without it both are
+    # ripgrep-15.2.0-1.fc44 and dnf can swap one for the other silently.
+    # It also sorts below Fedora's own release, so if Fedora ships the same
+    # name, a normal upgrade moves the user onto the native package.
+    add(f"Release:        {release}{RELEASE_MARKER}%{{?dist}}")
     add(f"Summary:        {spec_value(deb.summary or plan.name)}")
     add(f"License:        {spec_value(plan.license, limit=80)}")
     homepage = spec_url(deb.homepage)
     if homepage:
         add(f"URL:            {homepage}")
     add("BuildArch:      x86_64")
+    add(f"Vendor:         {VENDOR_TAG}")
+    add("# Lets `rpm -q --whatprovides debfed-converted` list every conversion.")
+    add("Provides:       debfed-converted")
     add("")
     add("# Converted from a Debian package; there is no buildable source.")
     add("Source0:        %{name}-%{version}.payload.tar")
@@ -427,7 +439,7 @@ def render(plan: SpecPlan, payload_dir: Path) -> str:
     add("")
     add("%changelog")
     stamp = datetime.now(UTC).strftime("%a %b %d %Y")
-    add(f"* {stamp} debfed <debfed@localhost> - {version}-{release}")
+    add(f"* {stamp} debfed <debfed@localhost> - {version}-{release}{RELEASE_MARKER}")
     add(f"- Automated conversion of {spec_value(deb.path.name, limit=120)}")
     add("")
 

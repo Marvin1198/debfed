@@ -212,14 +212,33 @@ installable.
 
 ## Installing
 
-From the latest release:
+From COPR (Fedora 43 and 44, x86_64). Updates arrive with `dnf upgrade`:
+
+```bash
+sudo dnf copr enable marvin1198/debfed
+sudo dnf install debfed
+```
+
+Or a single release RPM from GitHub, which does not update itself. Each
+release ships a `SHA256SUMS` alongside the package:
 
 ```bash
 sudo dnf install \
-  https://github.com/Marvin1198/debfed/releases/download/v0.1.0/debfed-0.1.0-1.fc44.noarch.rpm
+  https://github.com/Marvin1198/debfed/releases/download/v0.1.1/debfed-0.1.1-1.fc44.noarch.rpm
 ```
 
-Each release ships a `SHA256SUMS` alongside the package.
+### Telling converted packages apart
+
+Every package debfed builds carries a `.debfed` release marker, a
+`Vendor: debfed` tag, and `Provides: debfed-converted`:
+
+```bash
+rpm -q --whatprovides debfed-converted   # list everything debfed installed
+```
+
+If Fedora itself packages the same name, debfed says so before
+installing. The marker sorts below Fedora's own release, so a normal
+`dnf upgrade` replaces the conversion with the native package.
 
 Install as an RPM rather than with pip or pipx if you want the
 file-manager integration: the privileged helper and its polkit action

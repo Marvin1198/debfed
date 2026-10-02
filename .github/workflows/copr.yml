@@ -1,11 +1,9 @@
-## Submit to COPR, but only for a release that already passed every gate
-## and whose RPM built and installed cleanly.
+## Manual COPR resubmission. Tagged releases are submitted by the `copr`
+## job in ci.yml, after every gate has passed.
 
 name: copr
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:

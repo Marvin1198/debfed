@@ -32,6 +32,7 @@ from .build import (
     dnf_install,
     dnf_remove,
     find_conflicts,
+    repo_same_name,
     rpm_query_installed,
     verify_requires,
 )
@@ -39,7 +40,14 @@ from .bundle import BundleError, apply_bundle, plan_bundle, verify_bundle
 from .deb import Deb, DebError, unpack
 from .depsolve import Resolution, ResolveError, resolve
 from .layout import Relocation, relocate
-from .refuse import SAFE_TRIGGERS, Assessment, Severity, Verdict, assess
+from .refuse import (
+    SAFE_TRIGGERS,
+    Assessment,
+    Severity,
+    Verdict,
+    assess,
+    early_assessment,
+)
 from .runtime import probe as probe_host
 from .sanitize import UnsafeInput
 from .scripts import ScriptPlan, analyse_scripts, extract_symlinks
@@ -58,8 +66,11 @@ class Analysis:
     def __init__(self, deb: Deb, reloc: Relocation, res: Resolution,
                  assessment: Assessment, scripts: ScriptPlan,
                  extra_requires: list[str], unmapped: list[str],
-                 offline: bool = False):
+                 offline: bool = False, early: bool = False):
         self.deb = deb
+        # True when the package was refused from its control data alone,
+        # before the payload was relocated or resolved.
+        self.early = early
         self.reloc = reloc
         self.res = res
         self.assessment = assessment
@@ -102,6 +113,17 @@ def analyse(deb_path: Path, workdir: Path, *, offline: bool = False,
             map_file: Path | None = None,
             strict_scripts: bool = False) -> Analysis:
     deb = unpack(deb_path, workdir)
+
+    # Identity refusals (base packages, wrong architecture) need only the
+    # control file. Deciding them first means a base package never reaches
+    # path relocation -- base-files, which ships the /bin -> usr/bin link,
+    # used to crash there instead of being refused.
+    early = early_assessment(deb)
+    if early is not None:
+        return Analysis(deb, Relocation(buildroot=workdir / "buildroot"),
+                        Resolution(checked=False), early,
+                        ScriptPlan(), [], [], offline=offline, early=True)
+
     reloc = relocate(deb.payload_dir, workdir / "buildroot")
     res = resolve(reloc.buildroot, offline=offline)
     assessment = assess(deb, reloc, res, strict_scripts=strict_scripts)
@@ -124,13 +146,17 @@ def analyse(deb_path: Path, workdir: Path, *, offline: bool = False,
 
 
 def print_inspect(an: Analysis, verbose: bool = False) -> None:
-    deb, reloc, res, a = an.deb, an.reloc, an.res, an.assessment
+    deb, reloc, res = an.deb, an.reloc, an.res
     w = sys.stdout.write
 
     w(f"\n{_c(deb.name, BOLD)} {deb.version}  ({deb.architecture})\n")
     if deb.summary:
         w(f"  {deb.summary}\n")
     w("\n")
+
+    if an.early:
+        _print_verdict(an)
+        return
 
     w(f"  {_c('payload', DIM)}      {len(reloc.files)} files, "
       f"{len(reloc.symlinks)} symlinks, {len(reloc.dirs)} dirs\n")
@@ -216,6 +242,12 @@ def print_inspect(an: Analysis, verbose: bool = False) -> None:
         for key, value in host.as_dict().items():
             w(f"    {key:<26} {value}\n")
 
+    _print_verdict(an)
+
+
+def _print_verdict(an: Analysis) -> None:
+    res, a = an.res, an.assessment
+    w = sys.stdout.write
     if a.findings:
         w("\n")
         for f in a.findings:
@@ -462,6 +494,14 @@ def cmd_install(args: argparse.Namespace) -> int:
             print(f"\n  {len(conflicts)} file(s) already belong to installed "
                   "packages. Refusing.\n")
             return 1
+
+        native = repo_same_name(an.deb.name)
+        if native:
+            print(f"  {_c('note', YELLOW)} Fedora already packages "
+                  f"{an.deb.name}: {', '.join(native[:3])}")
+            print(f"        {_c('Prefer: sudo dnf install ' + an.deb.name, DIM)}")
+            print(f"        {_c('If you continue, the next dnf upgrade replaces', DIM)}"
+                  f" {_c('this conversion with the Fedora build.', DIM)}\n")
 
         existing = rpm_query_installed(an.deb.name)
         if existing:

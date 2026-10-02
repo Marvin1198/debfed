@@ -464,6 +464,13 @@ def resolve(buildroot: Path, jobs: int = 8, offline: bool = False) -> Resolution
         res.checked = False
         return res
 
+    # Skipped above only to save a dnf query; they still count as satisfied.
+    # Leaving them out made a static binary report "1 capabilities,
+    # 0 satisfied" next to "all 1 requirements resolve".
+    for cap in res.requires:
+        if cap in ALWAYS_SATISFIED and cap not in self_provided:
+            res.satisfied[cap] = ["glibc"]
+
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         owners = list(pool.map(_repoquery, to_check))
 

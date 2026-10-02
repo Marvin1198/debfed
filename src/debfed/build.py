@@ -181,6 +181,11 @@ def verify_requires(rpm_path: Path, blocking: list[str]) -> list[str]:
     return sorted(present & set(blocking))
 
 
+# What dnf prints when --assumeno ends the preview. In a dry run that is
+# the expected outcome, but the wording reads like a failure.
+_ASSUMENO_NOISE = ("Operation aborted by the user", "Operation aborted.")
+
+
 def dnf_install(rpm_path: Path, *, assume_yes: bool, test: bool = False) -> int:
     """Hand the built rpm to dnf so it owns resolution and the transaction."""
     dnf = _require("dnf", "dnf")
@@ -191,7 +196,37 @@ def dnf_install(rpm_path: Path, *, assume_yes: bool, test: bool = False) -> int:
         cmd.append("-y")
     if os.geteuid() != 0:
         cmd = [_require("sudo", "sudo"), *cmd]
-    return subprocess.run(cmd).returncode
+    if not test:
+        return subprocess.run(cmd).returncode
+    # sudo prompts on the terminal, not stdout, so capturing is safe.
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout.splitlines():
+        if line.strip().startswith(_ASSUMENO_NOISE):
+            continue
+        print(line)
+    return proc.returncode
+
+
+def repo_same_name(name: str) -> list[str]:
+    """Builds of `name` in the enabled repositories, as name-evr strings.
+
+    A converted package that shares its name with a Fedora package will be
+    replaced by Fedora's build on the next upgrade, because the .debfed
+    release marker sorts lower. The user should know that before
+    installing, and usually wants Fedora's build instead.
+    """
+    dnf = shutil.which("dnf5") or shutil.which("dnf")
+    if not dnf:
+        return []
+    proc = subprocess.run(
+        [dnf, "repoquery", "--quiet", "--available",
+         "--qf", "%{name}-%{evr} (%{repo_id})\n", name],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    return sorted({ln.strip() for ln in proc.stdout.splitlines() if ln.strip()})
 
 
 def dnf_remove(name: str, *, assume_yes: bool) -> int:

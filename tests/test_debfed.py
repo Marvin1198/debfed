@@ -2447,3 +2447,106 @@ def test_dry_run_hides_assumeno_noise(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "ripgrep" in out
     assert "aborted" not in out
+
+
+# =====================================================================
+# Transient dnf failures must never read as "no provider".
+#
+# resolve() runs repoquery in parallel; one failed dnf run returned empty
+# stdout and Claude Desktop 3.6556.1 was REFUSED over
+# libc.so.6(GLIBC_2.3.4)(64bit), which glibc provides.
+
+def _proc(rc, out="", err=""):
+    return subprocess.CompletedProcess(args=[], returncode=rc, stdout=out, stderr=err)
+
+
+def test_repoquery_retries_a_failed_dnf_run(monkeypatch):
+    from debfed import depsolve as d
+
+    calls = iter([_proc(1, err="Failed to obtain rpm transaction lock"),
+                  _proc(0, out="glibc\n")])
+    monkeypatch.setattr(d, "_dnf_bin", lambda: "dnf")
+    monkeypatch.setattr(d.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(d.subprocess, "run", lambda *a, **k: next(calls))
+    assert d._repoquery_one("libc.so.6(GLIBC_2.3.4)(64bit)") == ["glibc"]
+
+
+def test_repoquery_raises_instead_of_reporting_missing(monkeypatch):
+    from debfed import depsolve as d
+
+    monkeypatch.setattr(d, "_dnf_bin", lambda: "dnf")
+    monkeypatch.setattr(d.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(d.subprocess, "run",
+                        lambda *a, **k: _proc(1, err="metadata lock held"))
+    with pytest.raises(d.ResolveError, match="metadata lock held"):
+        d._repoquery_one("libc.so.6(GLIBC_2.3.4)(64bit)")
+
+
+def test_installed_provider_is_found_when_repos_say_nothing(monkeypatch):
+    from debfed import depsolve as d
+
+    monkeypatch.setattr(d, "_repoquery_one", lambda _s: [])
+    monkeypatch.setattr(d.shutil, "which", lambda _b: "/usr/bin/rpm")
+    monkeypatch.setattr(d.subprocess, "run",
+                        lambda cmd, **k: _proc(0, out="glibc\n")
+                        if cmd[0] == "rpm" else _proc(1))
+    assert d._repoquery("libc.so.6(GLIBC_2.3.4)(64bit)") == ["glibc"]
+
+
+def test_rpmdb_no_provider_is_an_empty_answer(monkeypatch):
+    from debfed import depsolve as d
+
+    monkeypatch.setattr(d.shutil, "which", lambda _b: "/usr/bin/rpm")
+    monkeypatch.setattr(d.subprocess, "run", lambda *a, **k: _proc(
+        1, out="no package provides libnope.so.1()(64bit)\n"))
+    assert d._rpmdb_query_one("libnope.so.1()(64bit)") == []
+
+
+# =====================================================================
+# Upgrading a converted package in place.
+#
+# Claude Desktop 2.9939.4 -> 3.6556.1 was refused with 1110 "file
+# conflicts", every one owned by claude-desktop itself.
+
+def test_upgrade_ignores_files_owned_by_the_package_being_replaced(monkeypatch):
+    from types import SimpleNamespace
+
+    from debfed import build as b
+
+    reloc = SimpleNamespace(files=["/usr/lib/app/app", "/usr/share/foo"])
+    monkeypatch.setattr(b, "_conflicts_via_bindings", lambda paths: [
+        b.Conflict("/usr/lib/app/app", "app"),
+        b.Conflict("/usr/share/foo", "app"),
+        b.Conflict("/usr/share/foo", "other-pkg"),
+    ])
+    assert b.find_conflicts(reloc) != []
+    left = b.find_conflicts(reloc, upgrading="app")
+    # a path shared with another package is still a real conflict
+    assert left == [b.Conflict("/usr/share/foo", "other-pkg")]
+
+
+def test_only_debfed_conversions_are_upgraded_in_place(monkeypatch):
+    from debfed import build as b
+
+    def fake_rpm(marker_names, release):
+        def run(cmd, **_k):
+            if "--whatprovides" in cmd:
+                return _proc(0 if marker_names else 1, out=marker_names)
+            return _proc(0 if release else 1, out=release)
+        return run
+
+    monkeypatch.setattr(b.shutil, "which", lambda _b: "/usr/bin/rpm")
+
+    monkeypatch.setattr(b.subprocess, "run", fake_rpm("app\n", ""))
+    assert b.installed_conversion("app")
+
+    monkeypatch.setattr(b.subprocess, "run", fake_rpm("", "1.debfed.fc44\n"))
+    assert b.installed_conversion("app")
+
+    # same name, but from Fedora or a third-party repo: not ours to replace
+    monkeypatch.setattr(b.subprocess, "run", fake_rpm("", "3.fc44\n"))
+    assert not b.installed_conversion("app")
+
+    # not installed at all
+    monkeypatch.setattr(b.subprocess, "run", fake_rpm("", ""))
+    assert not b.installed_conversion("app")

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .layout import Relocation
+from .spec import RELEASE_MARKER
 
 
 class BuildError(Exception):
@@ -48,8 +49,9 @@ def _conflicts_via_bindings(paths: list[str]) -> list[Conflict] | None:
             name = header[rpm.RPMTAG_NAME]
             if isinstance(name, bytes):
                 name = name.decode()
+            # Every owner, not just the first: a path shared by the package
+            # being upgraded AND another package is still a real conflict.
             conflicts.append(Conflict(path, name))
-            break
     return conflicts
 
 
@@ -74,27 +76,70 @@ def _conflicts_via_bulk_query(paths: list[str]) -> list[Conflict]:
     if proc.returncode != 0:
         return []
 
-    owners: dict[str, str] = {}
+    owners: dict[str, list[str]] = {}
     wanted = set(paths)
     for line in proc.stdout.splitlines():
         path, sep, name = line.partition("\t")
-        if sep and path in wanted:
-            owners.setdefault(path, name)
-    return [Conflict(p, owners[p]) for p in paths if p in owners]
+        if sep and path in wanted and name not in owners.setdefault(path, []):
+            owners[path].append(name)
+    return [Conflict(p, o) for p in paths for o in owners.get(p, [])]
 
 
-def find_conflicts(reloc: Relocation) -> list[Conflict]:
+CONVERTED_MARKER = "debfed-converted"
+
+
+def installed_conversion(name: str) -> bool:
+    """Is `name` installed AND an earlier debfed conversion?
+
+    Every debfed RPM carries `Provides: debfed-converted`. Only those may
+    be upgraded in place; a same-named package from Fedora or a third
+    party repo is not ours to replace.
+    """
+    rpm_bin = shutil.which("rpm")
+    if not rpm_bin:
+        return False
+    proc = subprocess.run(
+        [rpm_bin, "-q", "--qf", "%{NAME}\n", "--whatprovides", CONVERTED_MARKER],
+        capture_output=True, text=True,
+    )
+    if proc.returncode == 0 and name in {
+        line.strip() for line in proc.stdout.splitlines()
+    }:
+        return True
+    # Backup signal: every marked build also has a Release of the form
+    # N.debfed.fcXX, which survives even if the Provides is filtered out.
+    proc = subprocess.run(
+        [rpm_bin, "-q", "--qf", "%{RELEASE}\n", name],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return False
+    marker = RELEASE_MARKER + "."
+    return any(marker in line.strip() + "."
+               for line in proc.stdout.splitlines())
+
+
+def find_conflicts(reloc: Relocation, upgrading: str | None = None) -> list[Conflict]:
     """Which payload files are already owned by an installed rpm.
 
     Read-only. Catches the alien failure mode before rpm does, with a
     better message.
+
+    `upgrading` names the package this build replaces. Its files are not
+    conflicts: rpm -U swaps them in one transaction. Without this, every
+    upgrade of a converted package was refused -- Claude Desktop
+    2.9939.4 -> 3.6556.1 reported 1110 "conflicts", all owned by
+    claude-desktop itself. The caller passes it only for a debfed
+    conversion (see installed_conversion).
     """
     if not reloc.files:
         return []
-    via_bindings = _conflicts_via_bindings(reloc.files)
-    if via_bindings is not None:
-        return via_bindings
-    return _conflicts_via_bulk_query(reloc.files)
+    found = _conflicts_via_bindings(reloc.files)
+    if found is None:
+        found = _conflicts_via_bulk_query(reloc.files)
+    if upgrading:
+        found = [c for c in found if c.owner != upgrading]
+    return found
 
 
 @dataclass

@@ -224,7 +224,7 @@ release ships a `SHA256SUMS` alongside the package:
 
 ```bash
 sudo dnf install \
-  https://github.com/Marvin1198/debfed/releases/download/v0.1.1/debfed-0.1.1-1.fc44.noarch.rpm
+  https://github.com/Marvin1198/debfed/releases/download/v0.1.2/debfed-0.1.2-1.fc44.noarch.rpm
 ```
 
 ### Telling converted packages apart

@@ -2,7 +2,7 @@
 %global forgeurl https://github.com/Marvin1198/debfed
 
 Name:           debfed
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        Install Debian-targeted applications on Fedora as native RPMs
 
@@ -103,6 +103,13 @@ update-desktop-database &>/dev/null || :
 %{_mandir}/man1/debfed.1*
 
 %changelog
+* Thu Oct 22 2026 Marvin Patel <marvinpatel42@gmail.com> - 0.1.2-1
+- Retry failed dnf repoquery runs and raise instead of reporting a
+  dependency missing (a transient failure refused glibc symbols)
+- Fall back to the installed rpmdb when the repos return no provider
+- Allow in-place upgrade of an earlier debfed conversion: its own files
+  are no longer reported as file conflicts
+
 * Fri Oct 02 2026 Marvin Patel <marvinpatel42@gmail.com> - 0.1.1-1
 - Refuse base, Essential and Priority: required packages from control data,
   before relocation (base-files crashed instead of being refused)

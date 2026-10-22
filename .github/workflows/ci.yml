@@ -1,9 +1,13 @@
 ## debfed CI/CD - one workflow, all gates.
 ##
-## Runs on every push and PR. On a v* tag it ALSO builds, verifies and
-## publishes the RPM -- but only after every gate below has passed, via
-## `needs: gate` on the build job. A tag cannot ship an artifact that
-## skipped the checks.
+## Runs once per change: on pull requests, and on v* tags. A tag ALSO
+## builds, verifies and publishes the RPM -- but only after every gate
+## below has passed, via `needs: gate` on the build job. A tag cannot ship
+## an artifact that skipped the checks.
+##
+## No `push: branches: [main]` trigger: a merged PR was already tested on
+## its pull_request run, so a main push re-ran the identical suite. Direct
+## pushes to main are gated when they are tagged, or via workflow_dispatch.
 ##
 ## Action versions: Node 20 was removed from GitHub runners on 2026-09-16,
 ## so checkout/setup-python/upload-artifact are pinned to the Node 24
@@ -13,7 +17,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
     branches: [main]

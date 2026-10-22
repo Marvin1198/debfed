@@ -32,6 +32,7 @@ from .build import (
     dnf_install,
     dnf_remove,
     find_conflicts,
+    installed_conversion,
     repo_same_name,
     rpm_query_installed,
     verify_requires,
@@ -484,7 +485,8 @@ def cmd_install(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return 1
 
-        conflicts = find_conflicts(an.reloc)
+        upgrading = an.deb.name if installed_conversion(an.deb.name) else None
+        conflicts = find_conflicts(an.reloc, upgrading=upgrading)
         if conflicts:
             print(f"  {_c('FILE CONFLICTS', RED)}\n")
             for c in conflicts[:15]:

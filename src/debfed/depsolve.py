@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -183,32 +184,88 @@ def normalise_capability(cap: str) -> str:
     return cap
 
 
-def _repoquery_one(spec: str) -> list[str]:
-    proc = subprocess.run(
-        [
-            _dnf_bin(), "repoquery",
-            "--quiet",
-            # The trailing newline is essential: without it dnf writes every
-            # matching package name onto one line, and two providers become
-            # a single nonexistent package called "libcurllibcurl-minimal".
-            "--qf", "%{name}\n",
-            "--whatprovides", spec,
-        ],
-        capture_output=True,
-        text=True,
-    )
+REPOQUERY_ATTEMPTS = 3
+REPOQUERY_BACKOFF = 0.5  # seconds, doubled per retry
+
+
+def _names(stdout: str) -> list[str]:
     seen: list[str] = []
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         name = line.strip()
         if name and name not in seen:
             seen.append(name)
     return seen
 
 
+def _repoquery_one(spec: str) -> list[str]:
+    """Packages in the enabled repositories that provide `spec`.
+
+    A failed dnf run is NOT an empty answer. resolve() runs several of
+    these in parallel, and dnf can fail transiently (metadata lock, cache
+    refresh in progress). Reading that as "no provider" refused Claude
+    Desktop 3.6556.1 over libc.so.6(GLIBC_2.3.4)(64bit), which glibc
+    provides. So retry, and if dnf still fails, raise rather than guess.
+    """
+    dnf = _dnf_bin()
+    delay = REPOQUERY_BACKOFF
+    proc = None
+    for attempt in range(REPOQUERY_ATTEMPTS):
+        proc = subprocess.run(
+            [
+                dnf, "repoquery",
+                "--quiet",
+                # The trailing newline is essential: without it dnf writes every
+                # matching package name onto one line, and two providers become
+                # a single nonexistent package called "libcurllibcurl-minimal".
+                "--qf", "%{name}\n",
+                "--whatprovides", spec,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            return _names(proc.stdout)
+        if attempt + 1 < REPOQUERY_ATTEMPTS:
+            time.sleep(delay)
+            delay *= 2
+    detail = (proc.stderr or "").strip().splitlines()[-1:] if proc else []
+    raise ResolveError(
+        f"dnf repoquery failed {REPOQUERY_ATTEMPTS} times for {spec}"
+        + (f": {detail[0]}" if detail else "")
+    )
+
+
+def _rpmdb_query_one(spec: str) -> list[str]:
+    """Installed packages that provide `spec`, from the local rpm database.
+
+    A second, independent source. rpm exits 1 with "no package provides"
+    when nothing matches, which is a real empty answer.
+    """
+    if not shutil.which("rpm"):
+        return []
+    proc = subprocess.run(
+        ["rpm", "-q", "--qf", "%{NAME}\n", "--whatprovides", spec],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    return _names(proc.stdout)
+
+
 def _repoquery(cap: str) -> list[str]:
-    """Resolve a capability, trying each valid spelling of it."""
-    for spec in capability_variants(cap):
+    """Resolve a capability, trying each valid spelling of it.
+
+    Repositories first; then the installed rpm database, so a provider
+    that is already on this machine is never reported missing.
+    """
+    variants = capability_variants(cap)
+    for spec in variants:
         found = _repoquery_one(spec)
+        if found:
+            return found
+    for spec in variants:
+        found = _rpmdb_query_one(spec)
         if found:
             return found
     return []
